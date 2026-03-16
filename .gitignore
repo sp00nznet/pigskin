@@ -1,0 +1,46 @@
+# Build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Object files
+*.o
+*.obj
+*.lo
+*.slo
+
+# Executables
+*.exe
+*.out
+*.app
+
+# ROM files
+*.gen
+*.bin
+*.zip
+
+# Libraries
+*.lib
+*.a
+*.so
+*.dylib
+*.dll
+
+# IDE files
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln
+*.vcxproj*
+
+# Claude Code local settings
+.claude/
+
+# Misc
+*.log
+*.tmp
+__pycache__/

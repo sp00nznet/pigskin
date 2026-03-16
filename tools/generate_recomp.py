@@ -1,0 +1,1006 @@
+#!/usr/bin/env python3
+"""
+Pigskin Code Generator — translates M68K instructions to recompiled C code.
+
+Reads a Genesis ROM, disassembles all discovered functions, and generates C source
+files that use the genrecomp API (g_m68k, bus_read/write, M68K_* macros).
+
+Usage:
+    python tools/generate_recomp.py <rom_path> --output-dir src/recomp/
+"""
+
+import struct
+import sys
+import os
+import re
+from collections import defaultdict
+from capstone import Cs, CS_ARCH_M68K, CS_MODE_M68K_000
+from capstone.m68k import *
+
+# Import the analyzer
+sys.path.insert(0, os.path.dirname(__file__))
+from analyze_rom import GenesisROM, M68KAnalyzer
+
+
+# ============================================================
+# M68K → C instruction translator
+# ============================================================
+
+class M68KTranslator:
+    """Translates individual M68K instructions to C statements using genrecomp macros."""
+
+    # Map capstone condition codes to M68K_CC_* macros
+    CC_MAP = {
+        'hi': 'M68K_CC_HI', 'ls': 'M68K_CC_LS',
+        'cc': 'M68K_CC_CC', 'cs': 'M68K_CC_CS',
+        'ne': 'M68K_CC_NE', 'eq': 'M68K_CC_EQ',
+        'vc': 'M68K_CC_VC', 'vs': 'M68K_CC_VS',
+        'pl': 'M68K_CC_PL', 'mi': 'M68K_CC_MI',
+        'ge': 'M68K_CC_GE', 'lt': 'M68K_CC_LT',
+        'gt': 'M68K_CC_GT', 'le': 'M68K_CC_LE',
+    }
+
+    SIZE_SUFFIX = {'.b': 8, '.w': 16, '.l': 32}
+
+    def __init__(self, rom, labels):
+        self.rom = rom
+        self.labels = labels  # addr -> label name
+
+    def translate_instruction(self, addr, mnemonic, op_str, raw_bytes, func_start):
+        """Translate one M68K instruction to C code. Returns list of C lines."""
+        lines = []
+
+        # Add label if this address is a branch target
+        if addr in self.labels and addr != func_start:
+            label = self.labels[addr]
+            if label.startswith('loc_'):
+                lines.append(f"{label}:")
+
+        # Parse size suffix
+        size = 16  # default word
+        base_mnem = mnemonic
+        for suffix, sz in self.SIZE_SUFFIX.items():
+            if mnemonic.endswith(suffix):
+                size = sz
+                base_mnem = mnemonic[:-2]
+                break
+
+        # Dispatch to handler
+        c_code = self._translate(addr, base_mnem, mnemonic, op_str, size, raw_bytes)
+        if c_code:
+            lines.append(f"    {c_code}")
+        else:
+            # Fallback: emit as comment
+            hex_str = ' '.join(f'{b:02X}' for b in raw_bytes)
+            lines.append(f"    /* TODO ${addr:06X}: {mnemonic} {op_str}  [{hex_str}] */")
+
+        return lines
+
+    def _translate(self, addr, base, mnemonic, op_str, size, raw_bytes):
+        """Core translation dispatch."""
+        ops = [o.strip() for o in op_str.split(',', 1)] if op_str else []
+
+        # ---- MOVE family ----
+        if base == 'move':
+            return self._gen_move(ops, size)
+        if base == 'movea':
+            return self._gen_movea(ops, size)
+        if base == 'moveq':
+            return self._gen_moveq(ops)
+        if mnemonic == 'movem.l' or mnemonic == 'movem.w':
+            return self._gen_movem(ops, mnemonic, size)
+        if base == 'clr':
+            return self._gen_clr(ops, size)
+        if base == 'lea':
+            return self._gen_lea(ops)
+        if base == 'pea':
+            return self._gen_pea(ops)
+        if mnemonic == 'exg':
+            return self._gen_exg(ops)
+        if base == 'ext':
+            return self._gen_ext(ops, size)
+        if mnemonic == 'swap':
+            return self._gen_swap(ops)
+        if mnemonic == 'link':
+            return self._gen_link(ops)
+        if mnemonic == 'unlk':
+            return self._gen_unlk(ops)
+
+        # ---- Arithmetic ----
+        if base == 'add':
+            return self._gen_arith('ADD', ops, size)
+        if base == 'adda':
+            return self._gen_adda(ops, size)
+        if base == 'addi':
+            return self._gen_arith('ADD', ops, size)
+        if base == 'addq':
+            return self._gen_addq(ops, size)
+        if base == 'addx':
+            return self._gen_arith('ADDX', ops, size)
+        if base == 'sub':
+            return self._gen_arith('SUB', ops, size)
+        if base == 'suba':
+            return self._gen_suba(ops, size)
+        if base == 'subi':
+            return self._gen_arith('SUB', ops, size)
+        if base == 'subq':
+            return self._gen_subq(ops, size)
+        if base == 'subx':
+            return self._gen_arith('SUBX', ops, size)
+        if base == 'cmp':
+            return self._gen_cmp(ops, size)
+        if base == 'cmpa':
+            return self._gen_cmpa(ops, size)
+        if base == 'cmpi':
+            return self._gen_cmp(ops, size)
+        if base == 'neg':
+            return self._gen_neg('NEG', ops, size)
+        if base == 'negx':
+            return self._gen_neg('NEGX', ops, size)
+        if base == 'mulu':
+            return self._gen_mul('MULU', ops)
+        if base == 'muls':
+            return self._gen_mul('MULS', ops)
+        if base == 'divu':
+            return self._gen_div('DIVU', ops)
+        if base == 'divs':
+            return self._gen_div('DIVS', ops)
+
+        # ---- Logic ----
+        if base in ('and', 'andi'):
+            return self._gen_logic('AND', ops, size)
+        if base in ('or', 'ori'):
+            return self._gen_logic('OR', ops, size)
+        if base in ('eor', 'eori'):
+            return self._gen_logic('EOR', ops, size)
+        if base == 'not':
+            return self._gen_unary_logic('NOT', ops, size)
+        if base == 'tst':
+            return self._gen_tst(ops, size)
+
+        # ---- Bit operations ----
+        if base == 'btst':
+            return self._gen_btst(ops)
+        if base == 'bset':
+            return self._gen_bset(ops)
+        if base == 'bclr':
+            return self._gen_bclr(ops)
+        if base == 'bchg':
+            return self._gen_bchg(ops)
+
+        # ---- Shifts ----
+        if base == 'lsl':
+            return self._gen_shift('LSL', ops, size)
+        if base == 'lsr':
+            return self._gen_shift('LSR', ops, size)
+        if base == 'asl':
+            return self._gen_shift('LSL', ops, size)  # ASL == LSL
+        if base == 'asr':
+            return self._gen_shift('ASR', ops, size)
+        if base == 'rol':
+            return self._gen_shift('ROL', ops, size)
+        if base == 'ror':
+            return self._gen_shift('ROR', ops, size)
+        if base == 'roxl':
+            return self._gen_shift('ROXL', ops, size)
+        if base == 'roxr':
+            return self._gen_shift('ROXR', ops, size)
+
+        # ---- Branch ----
+        if base == 'bra':
+            return self._gen_bra(ops, addr)
+        if base == 'bsr':
+            return self._gen_bsr(ops, addr)
+        if base == 'jmp':
+            return self._gen_jmp(ops, addr)
+        if base == 'jsr':
+            return self._gen_jsr(ops, addr)
+        if mnemonic == 'rts':
+            return 'return;'
+        if mnemonic == 'rte':
+            return 'return; /* RTE */'
+        if mnemonic == 'rtr':
+            return '{ uint16_t _sr = bus_read16(g_m68k.a[7]); g_m68k.a[7] += 2; m68k_set_ccr((uint8_t)_sr); return; }'
+
+        # Conditional branches
+        for cc_suffix, cc_macro in self.CC_MAP.items():
+            if base == f'b{cc_suffix}':
+                return self._gen_bcc(cc_macro, ops, addr)
+            if base == f's{cc_suffix}':
+                return self._gen_scc(cc_macro, ops)
+            if base == f'db{cc_suffix}':
+                return self._gen_dbcc(cc_macro, ops, addr)
+
+        if mnemonic == 'dbra':
+            return self._gen_dbcc('0', ops, addr)  # DBRA = DBF
+        if mnemonic == 'st':
+            return self._gen_st(ops)
+        if mnemonic == 'sf':
+            return self._gen_sf(ops)
+
+        # ---- Stack ----
+        if mnemonic == 'nop':
+            return '/* nop */'
+
+        # ---- SR/CCR ----
+        if mnemonic == 'move.w' and 'sr' in op_str.lower():
+            return self._gen_move_sr(ops, mnemonic)
+        if 'andi' in mnemonic and 'sr' in op_str.lower():
+            return self._gen_andi_sr(ops)
+        if 'ori' in mnemonic and 'sr' in op_str.lower():
+            return self._gen_ori_sr(ops)
+
+        # ---- TRAP ----
+        if base == 'trap':
+            return f'recomp_m68k_exception({self._imm(ops[0])}); /* TRAP */'
+
+        return None  # unhandled
+
+    # ================================================================
+    # Operand helpers
+    # ================================================================
+
+    def _reg(self, op):
+        """Convert register name to C expression."""
+        op = op.strip().lower()
+        if re.match(r'^d[0-7]$', op):
+            return f'g_m68k.d[{op[1]}]'
+        if re.match(r'^a[0-7]$', op):
+            return f'g_m68k.a[{op[1]}]'
+        if op == 'sp':
+            return 'g_m68k.a[7]'
+        if op == 'sr':
+            return 'm68k_get_sr()'
+        if op == 'ccr':
+            return 'm68k_get_ccr()'
+        if op == 'usp':
+            return 'g_m68k.usp'
+        return None
+
+    def _imm(self, op):
+        """Extract immediate value."""
+        op = op.strip()
+        if op.startswith('#$'):
+            return f'0x{op[2:]}'
+        if op.startswith('#0x'):
+            return op[1:]
+        if op.startswith('#-$'):
+            return f'(-0x{op[3:]})'
+        if op.startswith('#-'):
+            return op[1:]
+        if op.startswith('#'):
+            return op[1:]
+        return None
+
+    def _ea_read(self, op, size):
+        """Generate C expression to READ from an effective address."""
+        op = op.strip()
+
+        # Register direct
+        r = self._reg(op)
+        if r:
+            return r
+
+        # Immediate
+        imm = self._imm(op)
+        if imm:
+            return imm
+
+        # (An) - register indirect
+        m = re.match(r'^\(a([0-7])\)$', op, re.I)
+        if m:
+            return f'bus_read{size}(g_m68k.a[{m.group(1)}])'
+
+        # (An)+ - postincrement
+        m = re.match(r'^\(a([0-7])\)\+$', op, re.I)
+        if m:
+            n = m.group(1)
+            inc = size // 8
+            return f'({{ uint{size}_t _v = bus_read{size}(g_m68k.a[{n}]); g_m68k.a[{n}] += {inc}; _v; }})'
+
+        # -(An) - predecrement
+        m = re.match(r'^-\(a([0-7])\)$', op, re.I)
+        if m:
+            n = m.group(1)
+            dec = size // 8
+            return f'({{ g_m68k.a[{n}] -= {dec}; bus_read{size}(g_m68k.a[{n}]); }})'
+
+        # d(An) - displacement
+        m = re.match(r'^(-?\$?[\dA-Fa-f]+)\(a([0-7])\)$', op, re.I)
+        if m:
+            disp = self._parse_disp(m.group(1))
+            return f'bus_read{size}(g_m68k.a[{m.group(2)}] + {disp})'
+
+        # d(An,Dn.w) or d(An,Dn.l) - indexed
+        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(a([0-7]),\s*d([0-7])(?:\.(w|l))?\)$', op, re.I)
+        if m:
+            disp = self._parse_disp(m.group(1)) if m.group(1) else '0'
+            idx_size = m.group(4) or 'w'
+            idx = f'g_m68k.d[{m.group(3)}]'
+            if idx_size.lower() == 'w':
+                idx = f'(int16_t)(uint16_t){idx}'
+            return f'bus_read{size}(g_m68k.a[{m.group(2)}] + {disp} + {idx})'
+
+        # d(PC) - PC relative
+        m = re.match(r'^(-?\$?[\dA-Fa-f]+)\(pc\)$', op, re.I)
+        if m:
+            disp = self._parse_disp(m.group(1))
+            return f'bus_read{size}({disp})'  # PC-relative resolved by capstone
+
+        # ($XXXX).w or ($XXXX).l - absolute
+        m = re.match(r'^\(\$([0-9A-Fa-f]+)\)\.(w|l)$', op, re.I)
+        if m:
+            addr_val = int(m.group(1), 16)
+            return f'bus_read{size}(0x{addr_val:06X})'
+
+        # $XXXX.l or $XXXX - absolute (no parens)
+        m = re.match(r'^\$([0-9A-Fa-f]+)(?:\.(w|l))?$', op, re.I)
+        if m:
+            addr_val = int(m.group(1), 16)
+            return f'bus_read{size}(0x{addr_val:06X})'
+
+        return f'/* UNHANDLED_READ: {op} */ 0'
+
+    def _ea_write(self, op, size, value_expr):
+        """Generate C statement to WRITE to an effective address."""
+        op = op.strip()
+
+        # Register direct
+        r = self._reg(op)
+        if r:
+            if size == 8:
+                return f'{r} = ({r} & 0xFFFFFF00u) | ((uint8_t)({value_expr}));'
+            elif size == 16:
+                return f'{r} = ({r} & 0xFFFF0000u) | ((uint16_t)({value_expr}));'
+            else:
+                return f'{r} = {value_expr};'
+
+        # (An)
+        m = re.match(r'^\(a([0-7])\)$', op, re.I)
+        if m:
+            return f'bus_write{size}(g_m68k.a[{m.group(1)}], {value_expr});'
+
+        # (An)+
+        m = re.match(r'^\(a([0-7])\)\+$', op, re.I)
+        if m:
+            n = m.group(1)
+            inc = size // 8
+            return f'bus_write{size}(g_m68k.a[{n}], {value_expr}); g_m68k.a[{n}] += {inc};'
+
+        # -(An)
+        m = re.match(r'^-\(a([0-7])\)$', op, re.I)
+        if m:
+            n = m.group(1)
+            dec = size // 8
+            return f'g_m68k.a[{n}] -= {dec}; bus_write{size}(g_m68k.a[{n}], {value_expr});'
+
+        # d(An)
+        m = re.match(r'^(-?\$?[\dA-Fa-f]+)\(a([0-7])\)$', op, re.I)
+        if m:
+            disp = self._parse_disp(m.group(1))
+            return f'bus_write{size}(g_m68k.a[{m.group(2)}] + {disp}, {value_expr});'
+
+        # d(An,Dn.x)
+        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(a([0-7]),\s*d([0-7])(?:\.(w|l))?\)$', op, re.I)
+        if m:
+            disp = self._parse_disp(m.group(1)) if m.group(1) else '0'
+            idx_size = m.group(4) or 'w'
+            idx = f'g_m68k.d[{m.group(3)}]'
+            if idx_size.lower() == 'w':
+                idx = f'(int16_t)(uint16_t){idx}'
+            return f'bus_write{size}(g_m68k.a[{m.group(2)}] + {disp} + {idx}, {value_expr});'
+
+        # Absolute
+        m = re.match(r'^\(\$([0-9A-Fa-f]+)\)\.(w|l)$', op, re.I)
+        if m:
+            addr_val = int(m.group(1), 16)
+            return f'bus_write{size}(0x{addr_val:06X}, {value_expr});'
+
+        m = re.match(r'^\$([0-9A-Fa-f]+)(?:\.(w|l))?$', op, re.I)
+        if m:
+            addr_val = int(m.group(1), 16)
+            return f'bus_write{size}(0x{addr_val:06X}, {value_expr});'
+
+        return f'/* UNHANDLED_WRITE: {op} = {value_expr} */'
+
+    def _parse_disp(self, s):
+        """Parse displacement value."""
+        s = s.strip()
+        if not s or s == '0':
+            return '0'
+        neg = s.startswith('-')
+        if neg:
+            s = s[1:]
+        if s.startswith('$'):
+            val = f'0x{s[1:]}'
+        elif s.startswith('0x'):
+            val = s
+        else:
+            val = s
+        return f'(-{val})' if neg else val
+
+    def _ea_addr(self, op):
+        """Generate C expression for the effective address itself (for LEA/PEA)."""
+        op = op.strip()
+
+        m = re.match(r'^\(a([0-7])\)$', op, re.I)
+        if m:
+            return f'g_m68k.a[{m.group(1)}]'
+
+        m = re.match(r'^(-?\$?[\dA-Fa-f]+)\(a([0-7])\)$', op, re.I)
+        if m:
+            disp = self._parse_disp(m.group(1))
+            return f'(g_m68k.a[{m.group(2)}] + {disp})'
+
+        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(a([0-7]),\s*d([0-7])(?:\.(w|l))?\)$', op, re.I)
+        if m:
+            disp = self._parse_disp(m.group(1)) if m.group(1) else '0'
+            idx = f'g_m68k.d[{m.group(3)}]'
+            idx_size = m.group(4) or 'w'
+            if idx_size.lower() == 'w':
+                idx = f'(int16_t)(uint16_t){idx}'
+            return f'(g_m68k.a[{m.group(2)}] + {disp} + {idx})'
+
+        m = re.match(r'^(-?\$?[\dA-Fa-f]+)\(pc\)$', op, re.I)
+        if m:
+            return self._parse_disp(m.group(1))
+
+        m = re.match(r'^\(\$([0-9A-Fa-f]+)\)\.(w|l)$', op, re.I)
+        if m:
+            return f'0x{int(m.group(1), 16):06X}'
+
+        m = re.match(r'^\$([0-9A-Fa-f]+)(?:\.(w|l))?$', op, re.I)
+        if m:
+            return f'0x{int(m.group(1), 16):06X}'
+
+        return f'/* UNHANDLED_ADDR: {op} */ 0'
+
+    # ================================================================
+    # Instruction generators
+    # ================================================================
+
+    def _gen_move(self, ops, size):
+        if len(ops) != 2:
+            return None
+        src = self._ea_read(ops[0], size)
+        stmt = self._ea_write(ops[1], size, src)
+        # MOVE updates N, Z, clears V, C
+        r = self._reg(ops[1])
+        if r:
+            mask = {8: '0xFF', 16: '0xFFFF', 32: '0xFFFFFFFFu'}[size]
+            return f'{stmt} M68K_TST{size}({r} & {mask});'
+        return f'{stmt} /* flags TODO */'
+
+    def _gen_movea(self, ops, size):
+        if len(ops) != 2:
+            return None
+        src = self._ea_read(ops[0], size)
+        r = self._reg(ops[1])
+        if r:
+            if size == 16:
+                return f'{r} = (uint32_t)(int32_t)(int16_t)(uint16_t)({src});'
+            return f'{r} = {src};'
+        return None
+
+    def _gen_moveq(self, ops):
+        if len(ops) != 2:
+            return None
+        imm = self._imm(ops[0])
+        r = self._reg(ops[1])
+        if imm and r:
+            return f'{r} = (uint32_t)(int32_t)(int8_t)({imm}); M68K_TST32({r});'
+        return None
+
+    def _gen_movem(self, ops, mnemonic, size):
+        return f'/* {mnemonic} {", ".join(ops)} — TODO: movem */'
+
+    def _gen_clr(self, ops, size):
+        if len(ops) != 1:
+            return None
+        stmt = self._ea_write(ops[0], size, '0')
+        return f'{stmt} g_m68k.flag_N = false; g_m68k.flag_Z = true; g_m68k.flag_V = false; g_m68k.flag_C = false;'
+
+    def _gen_lea(self, ops):
+        if len(ops) != 2:
+            return None
+        addr_expr = self._ea_addr(ops[0])
+        r = self._reg(ops[1])
+        if r:
+            return f'{r} = {addr_expr};'
+        return None
+
+    def _gen_pea(self, ops):
+        addr_expr = self._ea_addr(ops[0])
+        return f'g_m68k.a[7] -= 4; bus_write32(g_m68k.a[7], {addr_expr});'
+
+    def _gen_exg(self, ops):
+        r1 = self._reg(ops[0])
+        r2 = self._reg(ops[1])
+        if r1 and r2:
+            return f'{{ uint32_t _t = {r1}; {r1} = {r2}; {r2} = _t; }}'
+        return None
+
+    def _gen_ext(self, ops, size):
+        r = self._reg(ops[0])
+        if r:
+            if size == 16:
+                return f'M68K_EXT16({r});'
+            return f'M68K_EXT32({r});'
+        return None
+
+    def _gen_swap(self, ops):
+        r = self._reg(ops[0])
+        if r:
+            return f'M68K_SWAP({r});'
+        return None
+
+    def _gen_link(self, ops):
+        r = self._reg(ops[0])
+        imm = self._imm(ops[1])
+        if r and imm:
+            return f'g_m68k.a[7] -= 4; bus_write32(g_m68k.a[7], {r}); {r} = g_m68k.a[7]; g_m68k.a[7] += (int16_t)({imm});'
+        return None
+
+    def _gen_unlk(self, ops):
+        r = self._reg(ops[0])
+        if r:
+            return f'g_m68k.a[7] = {r}; {r} = bus_read32(g_m68k.a[7]); g_m68k.a[7] += 4;'
+        return None
+
+    def _gen_arith(self, op, ops, size):
+        if len(ops) != 2:
+            return None
+        src = self._ea_read(ops[0], size)
+        dst_r = self._reg(ops[1])
+        if dst_r:
+            return f'M68K_{op}{size}({dst_r}, {src});'
+        # Memory destination
+        return f'/* {op}{size} to memory: TODO */'
+
+    def _gen_adda(self, ops, size):
+        src = self._ea_read(ops[0], size)
+        r = self._reg(ops[1])
+        if r:
+            if size == 16:
+                return f'{r} += (int16_t)(uint16_t)({src});'
+            return f'{r} += {src};'
+        return None
+
+    def _gen_suba(self, ops, size):
+        src = self._ea_read(ops[0], size)
+        r = self._reg(ops[1])
+        if r:
+            if size == 16:
+                return f'{r} -= (int16_t)(uint16_t)({src});'
+            return f'{r} -= {src};'
+        return None
+
+    def _gen_addq(self, ops, size):
+        imm = self._imm(ops[0])
+        dst_r = self._reg(ops[1])
+        if imm and dst_r:
+            # ADDQ to An doesn't affect flags
+            if ops[1].strip().lower().startswith('a'):
+                return f'{dst_r} += {imm};'
+            return f'M68K_ADD{size}({dst_r}, {imm});'
+        return None
+
+    def _gen_subq(self, ops, size):
+        imm = self._imm(ops[0])
+        dst_r = self._reg(ops[1])
+        if imm and dst_r:
+            if ops[1].strip().lower().startswith('a'):
+                return f'{dst_r} -= {imm};'
+            return f'M68K_SUB{size}({dst_r}, {imm});'
+        return None
+
+    def _gen_cmp(self, ops, size):
+        src = self._ea_read(ops[0], size)
+        dst = self._ea_read(ops[1], size)
+        return f'M68K_CMP{size}({dst}, {src});'
+
+    def _gen_cmpa(self, ops, size):
+        src = self._ea_read(ops[0], size)
+        r = self._reg(ops[1])
+        if r:
+            if size == 16:
+                return f'M68K_CMP32({r}, (uint32_t)(int32_t)(int16_t)(uint16_t)({src}));'
+            return f'M68K_CMP32({r}, {src});'
+        return None
+
+    def _gen_neg(self, op, ops, size):
+        r = self._reg(ops[0])
+        if r:
+            return f'M68K_{op}{size}({r});'
+        return None
+
+    def _gen_mul(self, op, ops):
+        src = self._ea_read(ops[0], 16)
+        r = self._reg(ops[1])
+        if r:
+            return f'M68K_{op}({r}, {src});'
+        return None
+
+    def _gen_div(self, op, ops):
+        src = self._ea_read(ops[0], 16)
+        r = self._reg(ops[1])
+        if r:
+            return f'M68K_{op}({r}, {src});'
+        return None
+
+    def _gen_logic(self, op, ops, size):
+        src = self._ea_read(ops[0], size)
+        dst_r = self._reg(ops[1])
+        if dst_r:
+            return f'M68K_{op}{size}({dst_r}, {src});'
+        return None
+
+    def _gen_unary_logic(self, op, ops, size):
+        r = self._reg(ops[0])
+        if r:
+            return f'M68K_{op}{size}({r});'
+        return None
+
+    def _gen_tst(self, ops, size):
+        val = self._ea_read(ops[0], size)
+        return f'M68K_TST{size}({val});'
+
+    def _gen_btst(self, ops):
+        bit = self._ea_read(ops[0], 32)
+        val = self._ea_read(ops[1], 32)
+        r = self._reg(ops[1])
+        if r:
+            return f'M68K_BTST32({r}, {bit});'
+        return f'M68K_BTST8({val}, {bit});'
+
+    def _gen_bset(self, ops):
+        bit = self._ea_read(ops[0], 32)
+        r = self._reg(ops[1])
+        if r:
+            return f'M68K_BSET32({r}, {bit});'
+        return None
+
+    def _gen_bclr(self, ops):
+        bit = self._ea_read(ops[0], 32)
+        r = self._reg(ops[1])
+        if r:
+            return f'M68K_BCLR32({r}, {bit});'
+        return None
+
+    def _gen_bchg(self, ops):
+        bit = self._ea_read(ops[0], 32)
+        r = self._reg(ops[1])
+        if r:
+            return f'M68K_BCHG32({r}, {bit});'
+        return None
+
+    def _gen_shift(self, op, ops, size):
+        if len(ops) == 2:
+            cnt = self._ea_read(ops[0], 8)
+            r = self._reg(ops[1])
+            if r:
+                return f'M68K_{op}{size}({r}, {cnt});'
+        return None
+
+    def _gen_bra(self, ops, addr):
+        target = self._parse_branch_target(ops[0])
+        label = self.labels.get(target, f'loc_{target:06X}')
+        if label.startswith('loc_'):
+            return f'goto {label};'
+        return f'{{ {label}(); return; }}'
+
+    def _gen_bsr(self, ops, addr):
+        target = self._parse_branch_target(ops[0])
+        label = self.labels.get(target, f'sub_{target:06X}')
+        return f'func_table_call(0x{target:06X}); /* {label} */'
+
+    def _gen_jmp(self, ops, addr):
+        target = self._parse_branch_target(ops[0])
+        if target is not None:
+            label = self.labels.get(target, f'sub_{target:06X}')
+            if label.startswith('loc_'):
+                return f'goto {label};'
+            return f'{{ {label}(); return; }}'
+        return f'/* JMP indirect: {ops[0]} — TODO */'
+
+    def _gen_jsr(self, ops, addr):
+        target = self._parse_branch_target(ops[0])
+        if target is not None:
+            label = self.labels.get(target, f'sub_{target:06X}')
+            return f'func_table_call(0x{target:06X}); /* {label} */'
+        return f'/* JSR indirect: {ops[0]} — TODO */'
+
+    def _gen_bcc(self, cc_macro, ops, addr):
+        target = self._parse_branch_target(ops[0])
+        label = self.labels.get(target, f'loc_{target:06X}')
+        if label.startswith('loc_'):
+            return f'if ({cc_macro}) goto {label};'
+        return f'if ({cc_macro}) {{ {label}(); return; }}'
+
+    def _gen_scc(self, cc_macro, ops):
+        r = self._reg(ops[0])
+        if r:
+            return f'{r} = ({r} & 0xFFFFFF00u) | ({cc_macro} ? 0xFFu : 0x00u);'
+        return None
+
+    def _gen_dbcc(self, cc_macro, ops, addr):
+        r = self._reg(ops[0])
+        target = self._parse_branch_target(ops[1]) if len(ops) > 1 else None
+        if r and target is not None:
+            label = self.labels.get(target, f'loc_{target:06X}')
+            if cc_macro == '0':
+                # DBRA: always decrement and branch if != -1
+                return f'{{ int16_t _cnt = (int16_t)(uint16_t){r}; _cnt--; {r} = ({r} & 0xFFFF0000u) | (uint16_t)_cnt; if (_cnt != -1) goto {label}; }}'
+            return f'if (!({cc_macro})) {{ int16_t _cnt = (int16_t)(uint16_t){r}; _cnt--; {r} = ({r} & 0xFFFF0000u) | (uint16_t)_cnt; if (_cnt != -1) goto {label}; }}'
+        return None
+
+    def _gen_st(self, ops):
+        return self._ea_write(ops[0], 8, '0xFF')
+
+    def _gen_sf(self, ops):
+        return self._ea_write(ops[0], 8, '0x00')
+
+    def _gen_move_sr(self, ops, mnemonic):
+        if 'sr' in ops[0].lower():
+            # MOVE SR, <ea>
+            return self._ea_write(ops[1], 16, 'm68k_get_sr()')
+        else:
+            # MOVE <ea>, SR
+            src = self._ea_read(ops[0], 16)
+            return f'm68k_set_sr({src});'
+
+    def _gen_andi_sr(self, ops):
+        imm = self._imm(ops[0])
+        return f'm68k_set_sr(m68k_get_sr() & {imm});'
+
+    def _gen_ori_sr(self, ops):
+        imm = self._imm(ops[0])
+        return f'm68k_set_sr(m68k_get_sr() | {imm});'
+
+    def _parse_branch_target(self, op):
+        op = op.strip()
+        if op.startswith('$'):
+            try:
+                return int(op[1:], 16)
+            except ValueError:
+                return None
+        if op.startswith('0x'):
+            try:
+                return int(op, 16)
+            except ValueError:
+                return None
+        # Absolute with parens: ($XXXX).l
+        m = re.match(r'^\(\$([0-9A-Fa-f]+)\)\.(w|l)$', op)
+        if m:
+            return int(m.group(1), 16)
+        return None
+
+
+# ============================================================
+# Code generator — produces .c and .h files
+# ============================================================
+
+class CodeGenerator:
+    MAX_FUNCS_PER_FILE = 50
+
+    def __init__(self, rom, analyzer, translator, output_dir):
+        self.rom = rom
+        self.analyzer = analyzer
+        self.translator = translator
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+    def generate_all(self):
+        """Generate all recompiled C files."""
+        functions = sorted(self.analyzer.functions.values(), key=lambda f: f['start'])
+
+        # Split into chunks for manageable file sizes
+        chunks = []
+        for i in range(0, len(functions), self.MAX_FUNCS_PER_FILE):
+            chunk = functions[i:i + self.MAX_FUNCS_PER_FILE]
+            chunk_start = chunk[0]['start']
+            chunk_end = chunk[-1]['end']
+            chunk_name = f"recomp_{chunk_start:06X}_{chunk_end:06X}"
+            chunks.append((chunk_name, chunk))
+
+        # Generate each chunk
+        all_func_names = []
+        for chunk_name, chunk_funcs in chunks:
+            self._generate_chunk(chunk_name, chunk_funcs)
+            for f in chunk_funcs:
+                all_func_names.append(f['name'])
+
+        # Generate registration header
+        self._generate_registration(functions)
+
+        # Generate main entry point
+        self._generate_main(functions)
+
+        print(f"\nGenerated {len(chunks)} source files with {len(functions)} functions")
+        print(f"Output directory: {self.output_dir}")
+
+    def _generate_chunk(self, chunk_name, funcs):
+        """Generate one C source file for a chunk of functions."""
+        lines = []
+        lines.append(f'/* Auto-generated recompiled code for Pigskin Footbrawl */')
+        lines.append(f'/* Source range: ${funcs[0]["start"]:06X} - ${funcs[-1]["end"]:06X} */')
+        lines.append(f'/* Functions: {len(funcs)} */')
+        lines.append(f'')
+        lines.append(f'#include <genrecomp/genrecomp.h>')
+        lines.append(f'#include "recomp_funcs.h"')
+        lines.append(f'')
+
+        for func in funcs:
+            lines.extend(self._generate_function(func))
+            lines.append('')
+
+        path = os.path.join(self.output_dir, f'{chunk_name}.c')
+        with open(path, 'w') as f:
+            f.write('\n'.join(lines))
+
+    def _generate_function(self, func):
+        """Generate C code for one function."""
+        lines = []
+        name = func['name']
+        start = func['start']
+        end = func['end']
+        insn_addrs = func.get('insn_addrs', [])
+
+        lines.append(f'/* ${start:06X}-${end:06X}  ({func["insn_count"]} instructions, {func["size"]} bytes) */')
+        lines.append(f'void {name}(void) {{')
+
+        if not insn_addrs:
+            lines.append(f'    /* empty function */')
+            lines.append(f'}}')
+            return lines
+
+        for addr in insn_addrs:
+            if addr not in self.analyzer.instructions:
+                continue
+            mnemonic, op_str, size, raw = self.analyzer.instructions[addr]
+            c_lines = self.translator.translate_instruction(addr, mnemonic, op_str, raw, start)
+            lines.extend(c_lines)
+
+        # Ensure function has a return (if original didn't end with RTS)
+        if not func['has_return']:
+            lines.append(f'    /* WARNING: function did not end with RTS */')
+
+        lines.append(f'}}')
+        return lines
+
+    def _generate_registration(self, functions):
+        """Generate the header with forward declarations and registration function."""
+        lines = []
+        lines.append('/* Auto-generated — forward declarations + registration */')
+        lines.append('#ifndef RECOMP_FUNCS_H')
+        lines.append('#define RECOMP_FUNCS_H')
+        lines.append('')
+        lines.append('#include <genrecomp/genrecomp.h>')
+        lines.append('')
+
+        # Forward declarations
+        for func in functions:
+            lines.append(f'void {func["name"]}(void);')
+        lines.append('')
+
+        # Registration function
+        lines.append('static inline void recomp_register_all(void) {')
+        for func in functions:
+            lines.append(f'    func_table_register(0x{func["start"]:06X}, {func["name"]});')
+        lines.append('}')
+        lines.append('')
+        lines.append('#endif /* RECOMP_FUNCS_H */')
+
+        path = os.path.join(self.output_dir, 'recomp_funcs.h')
+        with open(path, 'w') as f:
+            f.write('\n'.join(lines))
+
+    def _generate_main(self, functions):
+        """Generate main.c with game lifecycle."""
+        # Find key functions
+        entry_name = None
+        vblank_name = None
+        for func in functions:
+            if func['start'] == self.rom.initial_pc:
+                entry_name = func['name']
+            if func['start'] == self.rom.vectors.get('irq6_vblank'):
+                vblank_name = func['name']
+
+        lines = []
+        lines.append('/*')
+        lines.append(f' * Pigskin Footbrawl — Statically Recompiled')
+        lines.append(f' * Auto-generated main entry point')
+        lines.append(f' *')
+        lines.append(f' * Original ROM: {self.rom.title_domestic} ({self.rom.copyright})')
+        lines.append(f' */')
+        lines.append('')
+        lines.append('#include <genrecomp/genrecomp.h>')
+        lines.append('#include "recomp/recomp_funcs.h"')
+        lines.append('#include <stdio.h>')
+        lines.append('')
+        lines.append('int main(int argc, char *argv[]) {')
+        lines.append('    (void)argc; (void)argv;')
+        lines.append('')
+        lines.append(f'    printf("Pigskin Footbrawl — Static Recompilation\\n");')
+        lines.append(f'    printf("==========================================\\n\\n");')
+        lines.append('')
+        lines.append('    if (!genrecomp_init("Pigskin Footbrawl (Recompiled)", 3)) {')
+        lines.append('        fprintf(stderr, "Failed to initialize genrecomp\\n");')
+        lines.append('        return 1;')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    /* Load original ROM for data (graphics, sound, tables) */')
+        lines.append('    const char *rom_path = (argc > 1) ? argv[1]')
+        lines.append(f'        : "Jerry Glanville\'s Pigskin Footbrawl (USA).gen";')
+        lines.append('    if (!genrecomp_load_rom(rom_path)) {')
+        lines.append('        fprintf(stderr, "Failed to load ROM: %s\\n", rom_path);')
+        lines.append('        return 1;')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    /* Register all recompiled functions */')
+        lines.append('    recomp_register_all();')
+        lines.append(f'    printf("Registered %d recompiled functions\\n\\n", {len(functions)});')
+        lines.append('')
+        lines.append('    /* Set initial CPU state */')
+        lines.append(f'    g_m68k.a[7] = 0x{self.rom.initial_sp & 0xFFFFFF:06X};')
+        lines.append(f'    g_m68k.pc = 0x{self.rom.initial_pc:06X};')
+        lines.append('    m68k_set_sr(0x2700); /* supervisor mode, all interrupts masked */')
+        lines.append('')
+
+        if entry_name:
+            lines.append(f'    /* Run initialization (original entry point at ${self.rom.initial_pc:06X}) */')
+            lines.append(f'    {entry_name}();')
+            lines.append('')
+
+        lines.append('    /* Main game loop */')
+        lines.append('    while (genrecomp_begin_frame()) {')
+        if vblank_name:
+            lines.append(f'        /* Trigger VBlank and run VBlank handler */')
+            lines.append(f'        genrecomp_trigger_vblank();')
+            lines.append(f'        {vblank_name}();')
+        else:
+            lines.append('        /* No VBlank handler found — run frame */')
+            lines.append('        genrecomp_trigger_vblank();')
+        lines.append('')
+        lines.append('        genrecomp_end_frame();')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    genrecomp_shutdown();')
+        lines.append('    return 0;')
+        lines.append('}')
+
+        path = os.path.join(os.path.dirname(self.output_dir), 'main.c')
+        with open(path, 'w') as f:
+            f.write('\n'.join(lines))
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Pigskin Code Generator')
+    parser.add_argument('rom', help='Path to Genesis ROM file')
+    parser.add_argument('--output-dir', '-o', default='src/recomp', help='Output directory for generated C files')
+    args = parser.parse_args()
+
+    print("=== Pigskin Code Generator ===\n")
+
+    rom = GenesisROM(args.rom)
+    rom.print_info()
+
+    print("\n--- Phase 1: Analysis ---")
+    analyzer = M68KAnalyzer(rom)
+    analyzer.analyze()
+
+    print("\n--- Phase 2: Code Generation ---")
+    translator = M68KTranslator(rom, analyzer.labels)
+    generator = CodeGenerator(rom, analyzer, translator, args.output_dir)
+    generator.generate_all()
+
+    print("\nDone!")
+
+
+if __name__ == '__main__':
+    main()
