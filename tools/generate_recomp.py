@@ -45,9 +45,13 @@ class M68KTranslator:
     def __init__(self, rom, labels):
         self.rom = rom
         self.labels = labels  # addr -> label name
+        self.func_start = 0
+        self.func_end = 0
 
-    def translate_instruction(self, addr, mnemonic, op_str, raw_bytes, func_start):
+    def translate_instruction(self, addr, mnemonic, op_str, raw_bytes, func_start, func_end=0):
         """Translate one M68K instruction to C code. Returns list of C lines."""
+        self.func_start = func_start
+        self.func_end = func_end
         lines = []
 
         # Add label if this address is a branch target
@@ -78,9 +82,12 @@ class M68KTranslator:
 
     def _translate(self, addr, base, mnemonic, op_str, size, raw_bytes):
         """Core translation dispatch."""
-        ops = [o.strip() for o in op_str.split(',', 1)] if op_str else []
+        ops = self._split_operands(op_str) if op_str else []
 
         # ---- MOVE family ----
+        # Check SR/CCR first before generic move
+        if base == 'move' and any(o.strip().lower() in ('sr', 'ccr') for o in ops):
+            return self._gen_move_sr(ops, mnemonic)
         if base == 'move':
             return self._gen_move(ops, size)
         if base == 'movea':
@@ -95,7 +102,7 @@ class M68KTranslator:
             return self._gen_lea(ops)
         if base == 'pea':
             return self._gen_pea(ops)
-        if mnemonic == 'exg':
+        if base == 'exg' or mnemonic == 'exg':
             return self._gen_exg(ops)
         if base == 'ext':
             return self._gen_ext(ops, size)
@@ -147,6 +154,25 @@ class M68KTranslator:
             return self._gen_div('DIVS', ops)
 
         # ---- Logic ----
+        # Check for ANDI/ORI/EORI to SR/CCR first
+        if base in ('andi', 'ori', 'eori') and len(ops) == 2:
+            dst_lower = ops[1].strip().lower()
+            if dst_lower == 'sr':
+                imm = self._imm(ops[0])
+                if base == 'andi':
+                    return f'm68k_set_sr(m68k_get_sr() & {imm});'
+                elif base == 'ori':
+                    return f'm68k_set_sr(m68k_get_sr() | {imm});'
+                else:
+                    return f'm68k_set_sr(m68k_get_sr() ^ {imm});'
+            if dst_lower == 'ccr':
+                imm = self._imm(ops[0])
+                if base == 'andi':
+                    return f'm68k_set_ccr(m68k_get_ccr() & {imm});'
+                elif base == 'ori':
+                    return f'm68k_set_ccr(m68k_get_ccr() | {imm});'
+                else:
+                    return f'm68k_set_ccr(m68k_get_ccr() ^ {imm});'
         if base in ('and', 'andi'):
             return self._gen_logic('AND', ops, size)
         if base in ('or', 'ori'):
@@ -213,9 +239,9 @@ class M68KTranslator:
 
         if mnemonic == 'dbra':
             return self._gen_dbcc('0', ops, addr)  # DBRA = DBF
-        if mnemonic == 'st':
+        if base == 'st' or mnemonic == 'st':
             return self._gen_st(ops)
-        if mnemonic == 'sf':
+        if base == 'sf' or mnemonic == 'sf':
             return self._gen_sf(ops)
 
         # ---- Stack ----
@@ -223,8 +249,6 @@ class M68KTranslator:
             return '/* nop */'
 
         # ---- SR/CCR ----
-        if mnemonic == 'move.w' and 'sr' in op_str.lower():
-            return self._gen_move_sr(ops, mnemonic)
         if 'andi' in mnemonic and 'sr' in op_str.lower():
             return self._gen_andi_sr(ops)
         if 'ori' in mnemonic and 'sr' in op_str.lower():
@@ -239,6 +263,51 @@ class M68KTranslator:
     # ================================================================
     # Operand helpers
     # ================================================================
+
+    @staticmethod
+    def _split_operands(op_str):
+        """Split operand string by comma, respecting parentheses nesting."""
+        parts = []
+        depth = 0
+        current = []
+        for ch in op_str:
+            if ch == '(' or ch == '[':
+                depth += 1
+                current.append(ch)
+            elif ch == ')' or ch == ']':
+                depth -= 1
+                current.append(ch)
+            elif ch == ',' and depth == 0:
+                parts.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            parts.append(''.join(current).strip())
+        return parts
+
+    @staticmethod
+    def _parse_reglist(reglist_str):
+        """Parse M68K register list string into list of register names.
+        E.g. 'd0-d3/a2-a4' -> ['d0','d1','d2','d3','a2','a3','a4']
+        """
+        regs = []
+        # Split by '/'
+        for part in reglist_str.replace(' ', '').lower().split('/'):
+            m = re.match(r'^([da])(\d)-([da])(\d)$', part)
+            if m:
+                kind = m.group(1)
+                start = int(m.group(2))
+                end = int(m.group(4))
+                for i in range(start, end + 1):
+                    regs.append(f'{kind}{i}')
+            else:
+                m2 = re.match(r'^([da])(\d)$', part)
+                if m2:
+                    regs.append(f'{m2.group(1)}{m2.group(2)}')
+                elif part == 'sp':
+                    regs.append('a7')
+        return regs
 
     def _reg(self, op):
         """Convert register name to C expression."""
@@ -291,19 +360,17 @@ class M68KTranslator:
         if m:
             return f'bus_read{size}(g_m68k.a[{m.group(1)}])'
 
-        # (An)+ - postincrement
+        # (An)+ - postincrement (use helper to avoid GCC statement expressions)
         m = re.match(r'^\(a([0-7])\)\+$', op, re.I)
         if m:
             n = m.group(1)
-            inc = size // 8
-            return f'({{ uint{size}_t _v = bus_read{size}(g_m68k.a[{n}]); g_m68k.a[{n}] += {inc}; _v; }})'
+            return f'_postinc{size}({n})'
 
         # -(An) - predecrement
         m = re.match(r'^-\(a([0-7])\)$', op, re.I)
         if m:
             n = m.group(1)
-            dec = size // 8
-            return f'({{ g_m68k.a[{n}] -= {dec}; bus_read{size}(g_m68k.a[{n}]); }})'
+            return f'_predec{size}({n})'
 
         # d(An) - displacement
         m = re.match(r'^(-?\$?[\dA-Fa-f]+)\(a([0-7])\)$', op, re.I)
@@ -311,14 +378,24 @@ class M68KTranslator:
             disp = self._parse_disp(m.group(1))
             return f'bus_read{size}(g_m68k.a[{m.group(2)}] + {disp})'
 
-        # d(An,Dn.w) or d(An,Dn.l) - indexed
-        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(a([0-7]),\s*d([0-7])(?:\.(w|l))?\)$', op, re.I)
+        # d(An,Xn.s) or d(An,Xn.s * scale) - indexed with data or address register
+        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(a([0-7]),\s*([da])([0-7])(?:\.(w|l))?(?:\s*\*\s*(\d+))?\)$', op, re.I)
         if m:
             disp = self._parse_disp(m.group(1)) if m.group(1) else '0'
-            idx_size = m.group(4) or 'w'
-            idx = f'g_m68k.d[{m.group(3)}]'
-            if idx_size.lower() == 'w':
+            idx_kind = m.group(3).lower()
+            idx_num = m.group(4)
+            idx_size = (m.group(5) or 'w').lower()
+            scale = m.group(6)
+            if idx_kind == 'd':
+                idx = f'g_m68k.d[{idx_num}]'
+            else:
+                idx = f'g_m68k.a[{idx_num}]'
+            if idx_size == 'w':
                 idx = f'(int16_t)(uint16_t){idx}'
+            else:
+                idx = f'(int32_t){idx}'
+            if scale and scale != '1':
+                idx = f'{idx} * {scale}'
             return f'bus_read{size}(g_m68k.a[{m.group(2)}] + {disp} + {idx})'
 
         # d(PC) - PC relative
@@ -326,6 +403,26 @@ class M68KTranslator:
         if m:
             disp = self._parse_disp(m.group(1))
             return f'bus_read{size}({disp})'  # PC-relative resolved by capstone
+
+        # d(PC, Xn.s) - PC relative indexed
+        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(pc,\s*([da])([0-7])(?:\.(w|l))?(?:\s*\*\s*(\d+))?\)$', op, re.I)
+        if m:
+            disp = self._parse_disp(m.group(1)) if m.group(1) else '0'
+            idx_kind = m.group(2).lower()
+            idx_num = m.group(3)
+            idx_size = (m.group(4) or 'w').lower()
+            scale = m.group(5)
+            if idx_kind == 'd':
+                idx = f'g_m68k.d[{idx_num}]'
+            else:
+                idx = f'g_m68k.a[{idx_num}]'
+            if idx_size == 'w':
+                idx = f'(int16_t)(uint16_t){idx}'
+            else:
+                idx = f'(int32_t){idx}'
+            if scale and scale != '1':
+                idx = f'{idx} * {scale}'
+            return f'bus_read{size}({disp} + {idx})'
 
         # ($XXXX).w or ($XXXX).l - absolute
         m = re.match(r'^\(\$([0-9A-Fa-f]+)\)\.(w|l)$', op, re.I)
@@ -380,14 +477,24 @@ class M68KTranslator:
             disp = self._parse_disp(m.group(1))
             return f'bus_write{size}(g_m68k.a[{m.group(2)}] + {disp}, {value_expr});'
 
-        # d(An,Dn.x)
-        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(a([0-7]),\s*d([0-7])(?:\.(w|l))?\)$', op, re.I)
+        # d(An,Xn.s) or d(An,Xn.s * scale) - indexed with data or address register
+        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(a([0-7]),\s*([da])([0-7])(?:\.(w|l))?(?:\s*\*\s*(\d+))?\)$', op, re.I)
         if m:
             disp = self._parse_disp(m.group(1)) if m.group(1) else '0'
-            idx_size = m.group(4) or 'w'
-            idx = f'g_m68k.d[{m.group(3)}]'
-            if idx_size.lower() == 'w':
+            idx_kind = m.group(3).lower()
+            idx_num = m.group(4)
+            idx_size = (m.group(5) or 'w').lower()
+            scale = m.group(6)
+            if idx_kind == 'd':
+                idx = f'g_m68k.d[{idx_num}]'
+            else:
+                idx = f'g_m68k.a[{idx_num}]'
+            if idx_size == 'w':
                 idx = f'(int16_t)(uint16_t){idx}'
+            else:
+                idx = f'(int32_t){idx}'
+            if scale and scale != '1':
+                idx = f'{idx} * {scale}'
             return f'bus_write{size}(g_m68k.a[{m.group(2)}] + {disp} + {idx}, {value_expr});'
 
         # Absolute
@@ -420,8 +527,18 @@ class M68KTranslator:
         return f'(-{val})' if neg else val
 
     def _ea_addr(self, op):
-        """Generate C expression for the effective address itself (for LEA/PEA)."""
+        """Generate C expression for the effective address itself (for LEA/PEA/memory RMW)."""
         op = op.strip()
+
+        # (An)+  — for _ea_addr in RMW context, just use current An
+        m = re.match(r'^\(a([0-7])\)\+$', op, re.I)
+        if m:
+            return f'g_m68k.a[{m.group(1)}]'
+
+        # -(An) — for _ea_addr in RMW context, pre-decrement is caller's job
+        m = re.match(r'^-\(a([0-7])\)$', op, re.I)
+        if m:
+            return f'g_m68k.a[{m.group(1)}]'
 
         m = re.match(r'^\(a([0-7])\)$', op, re.I)
         if m:
@@ -432,18 +549,48 @@ class M68KTranslator:
             disp = self._parse_disp(m.group(1))
             return f'(g_m68k.a[{m.group(2)}] + {disp})'
 
-        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(a([0-7]),\s*d([0-7])(?:\.(w|l))?\)$', op, re.I)
+        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(a([0-7]),\s*([da])([0-7])(?:\.(w|l))?(?:\s*\*\s*(\d+))?\)$', op, re.I)
         if m:
             disp = self._parse_disp(m.group(1)) if m.group(1) else '0'
-            idx = f'g_m68k.d[{m.group(3)}]'
-            idx_size = m.group(4) or 'w'
-            if idx_size.lower() == 'w':
+            idx_kind = m.group(3).lower()
+            idx_num = m.group(4)
+            idx_size = (m.group(5) or 'w').lower()
+            scale = m.group(6)
+            if idx_kind == 'd':
+                idx = f'g_m68k.d[{idx_num}]'
+            else:
+                idx = f'g_m68k.a[{idx_num}]'
+            if idx_size == 'w':
                 idx = f'(int16_t)(uint16_t){idx}'
+            else:
+                idx = f'(int32_t){idx}'
+            if scale and scale != '1':
+                idx = f'{idx} * {scale}'
             return f'(g_m68k.a[{m.group(2)}] + {disp} + {idx})'
 
         m = re.match(r'^(-?\$?[\dA-Fa-f]+)\(pc\)$', op, re.I)
         if m:
             return self._parse_disp(m.group(1))
+
+        # d(PC, Xn.s) - PC relative indexed
+        m = re.match(r'^(-?\$?[\dA-Fa-f]*)\(pc,\s*([da])([0-7])(?:\.(w|l))?(?:\s*\*\s*(\d+))?\)$', op, re.I)
+        if m:
+            disp = self._parse_disp(m.group(1)) if m.group(1) else '0'
+            idx_kind = m.group(2).lower()
+            idx_num = m.group(3)
+            idx_size = (m.group(4) or 'w').lower()
+            scale = m.group(5)
+            if idx_kind == 'd':
+                idx = f'g_m68k.d[{idx_num}]'
+            else:
+                idx = f'g_m68k.a[{idx_num}]'
+            if idx_size == 'w':
+                idx = f'(int16_t)(uint16_t){idx}'
+            else:
+                idx = f'(int32_t){idx}'
+            if scale and scale != '1':
+                idx = f'{idx} * {scale}'
+            return f'({disp} + {idx})'
 
         m = re.match(r'^\(\$([0-9A-Fa-f]+)\)\.(w|l)$', op, re.I)
         if m:
@@ -463,13 +610,14 @@ class M68KTranslator:
         if len(ops) != 2:
             return None
         src = self._ea_read(ops[0], size)
-        stmt = self._ea_write(ops[1], size, src)
         # MOVE updates N, Z, clears V, C
         r = self._reg(ops[1])
         if r:
+            stmt = self._ea_write(ops[1], size, src)
             mask = {8: '0xFF', 16: '0xFFFF', 32: '0xFFFFFFFFu'}[size]
             return f'{stmt} M68K_TST{size}({r} & {mask});'
-        return f'{stmt} /* flags TODO */'
+        # Memory destination: use temp for flag testing
+        return f'{{ uint{size}_t _mv = (uint{size}_t)({src}); {self._ea_write(ops[1], size, "_mv")} M68K_TST{size}(_mv); }}'
 
     def _gen_movea(self, ops, size):
         if len(ops) != 2:
@@ -492,7 +640,110 @@ class M68KTranslator:
         return None
 
     def _gen_movem(self, ops, mnemonic, size):
-        return f'/* {mnemonic} {", ".join(ops)} — TODO: movem */'
+        byte_size = size // 8  # 2 for .w, 4 for .l
+        read_fn = f'bus_read{size}'
+        write_fn = f'bus_write{size}'
+
+        # Determine direction: register-to-memory or memory-to-register
+        # movem <reglist>, <ea>  -- store regs to memory
+        # movem <ea>, <reglist>  -- load regs from memory
+
+        # Check if first operand is a register list (contains d or a with ranges/slashes)
+        def _is_reglist(s):
+            s = s.strip().lower()
+            return bool(re.match(r'^[da]\d', s)) and ('/' in s or '-' in s or re.match(r'^[da]\d$', s))
+
+        if _is_reglist(ops[0]):
+            # Store: movem <reglist>, <ea>
+            reglist = self._parse_reglist(ops[0])
+            ea = ops[1].strip()
+
+            # -(An) predecrement: push in reverse order
+            m = re.match(r'^-\(a([0-7])\)$', ea, re.I)
+            if m:
+                n = m.group(1)
+                stmts = []
+                # Reverse order: A7..A0 then D7..D0, but only regs in list
+                all_regs_reverse = [f'a{i}' for i in range(7, -1, -1)] + [f'd{i}' for i in range(7, -1, -1)]
+                for r in all_regs_reverse:
+                    if r in reglist:
+                        reg_c = self._reg(r)
+                        stmts.append(f'g_m68k.a[{n}] -= {byte_size}; {write_fn}(g_m68k.a[{n}], {reg_c});')
+                return ' '.join(stmts)
+
+            # (An) no update: store with temp addr
+            m = re.match(r'^\(a([0-7])\)$', ea, re.I)
+            if m:
+                n = m.group(1)
+                stmts = [f'{{ uint32_t _addr = g_m68k.a[{n}];']
+                for r in reglist:
+                    reg_c = self._reg(r)
+                    stmts.append(f'{write_fn}(_addr, {reg_c}); _addr += {byte_size};')
+                stmts.append('}')
+                return ' '.join(stmts)
+
+            # d(An): store with displacement
+            m = re.match(r'^(-?\$?[\dA-Fa-f]+)\(a([0-7])\)$', ea, re.I)
+            if m:
+                disp = self._parse_disp(m.group(1))
+                n = m.group(2)
+                stmts = [f'{{ uint32_t _addr = g_m68k.a[{n}] + {disp};']
+                for r in reglist:
+                    reg_c = self._reg(r)
+                    stmts.append(f'{write_fn}(_addr, {reg_c}); _addr += {byte_size};')
+                stmts.append('}')
+                return ' '.join(stmts)
+
+            return f'/* TODO: movem store to {ea} */'
+
+        else:
+            # Load: movem <ea>, <reglist>
+            reglist = self._parse_reglist(ops[1])
+            ea = ops[0].strip()
+
+            # (An)+ postincrement
+            m = re.match(r'^\(a([0-7])\)\+$', ea, re.I)
+            if m:
+                n = m.group(1)
+                stmts = []
+                for r in reglist:
+                    reg_c = self._reg(r)
+                    if size == 16:
+                        stmts.append(f'{reg_c} = (uint32_t)(int32_t)(int16_t){read_fn}(g_m68k.a[{n}]); g_m68k.a[{n}] += {byte_size};')
+                    else:
+                        stmts.append(f'{reg_c} = {read_fn}(g_m68k.a[{n}]); g_m68k.a[{n}] += {byte_size};')
+                return ' '.join(stmts)
+
+            # (An) no update
+            m = re.match(r'^\(a([0-7])\)$', ea, re.I)
+            if m:
+                n = m.group(1)
+                stmts = [f'{{ uint32_t _addr = g_m68k.a[{n}];']
+                for r in reglist:
+                    reg_c = self._reg(r)
+                    if size == 16:
+                        stmts.append(f'{reg_c} = (uint32_t)(int32_t)(int16_t){read_fn}(_addr); _addr += {byte_size};')
+                    else:
+                        stmts.append(f'{reg_c} = {read_fn}(_addr); _addr += {byte_size};')
+                stmts.append('}')
+                return ' '.join(stmts)
+
+            # d(An) displacement
+            m = re.match(r'^(-?\$?[\dA-Fa-f]+)\(a([0-7])\)$', ea, re.I)
+            if m:
+                disp = self._parse_disp(m.group(1))
+                n = m.group(2)
+                stmts = [f'{{ uint32_t _addr = g_m68k.a[{n}] + {disp};']
+                for r in reglist:
+                    reg_c = self._reg(r)
+                    if size == 16:
+                        stmts.append(f'{reg_c} = (uint32_t)(int32_t)(int16_t){read_fn}(_addr); _addr += {byte_size};')
+                    else:
+                        stmts.append(f'{reg_c} = {read_fn}(_addr); _addr += {byte_size};')
+                stmts.append('}')
+                return ' '.join(stmts)
+
+            return f'/* TODO: movem load from {ea} */'
 
     def _gen_clr(self, ops, size):
         if len(ops) != 1:
@@ -554,8 +805,10 @@ class M68KTranslator:
         dst_r = self._reg(ops[1])
         if dst_r:
             return f'M68K_{op}{size}({dst_r}, {src});'
-        # Memory destination
-        return f'/* {op}{size} to memory: TODO */'
+        # Memory destination: read-modify-write
+        ea_addr = self._ea_addr(ops[1])
+        return (f'{{ uint32_t _ea = {ea_addr}; uint{size}_t _tmp = bus_read{size}(_ea); '
+                f'M68K_{op}{size}(_tmp, {src}); bus_write{size}(_ea, _tmp); }}')
 
     def _gen_adda(self, ops, size):
         src = self._ea_read(ops[0], size)
@@ -577,22 +830,31 @@ class M68KTranslator:
 
     def _gen_addq(self, ops, size):
         imm = self._imm(ops[0])
+        if not imm:
+            return None
         dst_r = self._reg(ops[1])
-        if imm and dst_r:
-            # ADDQ to An doesn't affect flags
+        if dst_r:
             if ops[1].strip().lower().startswith('a'):
                 return f'{dst_r} += {imm};'
             return f'M68K_ADD{size}({dst_r}, {imm});'
-        return None
+        # Memory destination
+        ea_addr = self._ea_addr(ops[1])
+        return (f'{{ uint32_t _ea = {ea_addr}; uint{size}_t _tmp = bus_read{size}(_ea); '
+                f'M68K_ADD{size}(_tmp, {imm}); bus_write{size}(_ea, _tmp); }}')
 
     def _gen_subq(self, ops, size):
         imm = self._imm(ops[0])
+        if not imm:
+            return None
         dst_r = self._reg(ops[1])
-        if imm and dst_r:
+        if dst_r:
             if ops[1].strip().lower().startswith('a'):
                 return f'{dst_r} -= {imm};'
             return f'M68K_SUB{size}({dst_r}, {imm});'
-        return None
+        # Memory destination
+        ea_addr = self._ea_addr(ops[1])
+        return (f'{{ uint32_t _ea = {ea_addr}; uint{size}_t _tmp = bus_read{size}(_ea); '
+                f'M68K_SUB{size}(_tmp, {imm}); bus_write{size}(_ea, _tmp); }}')
 
     def _gen_cmp(self, ops, size):
         src = self._ea_read(ops[0], size)
@@ -612,7 +874,10 @@ class M68KTranslator:
         r = self._reg(ops[0])
         if r:
             return f'M68K_{op}{size}({r});'
-        return None
+        # Memory destination
+        ea_addr = self._ea_addr(ops[0])
+        return (f'{{ uint32_t _ea = {ea_addr}; uint{size}_t _tmp = bus_read{size}(_ea); '
+                f'M68K_{op}{size}(_tmp); bus_write{size}(_ea, _tmp); }}')
 
     def _gen_mul(self, op, ops):
         src = self._ea_read(ops[0], 16)
@@ -633,13 +898,19 @@ class M68KTranslator:
         dst_r = self._reg(ops[1])
         if dst_r:
             return f'M68K_{op}{size}({dst_r}, {src});'
-        return None
+        # Memory destination
+        ea_addr = self._ea_addr(ops[1])
+        return (f'{{ uint32_t _ea = {ea_addr}; uint{size}_t _tmp = bus_read{size}(_ea); '
+                f'M68K_{op}{size}(_tmp, {src}); bus_write{size}(_ea, _tmp); }}')
 
     def _gen_unary_logic(self, op, ops, size):
         r = self._reg(ops[0])
         if r:
             return f'M68K_{op}{size}({r});'
-        return None
+        # Memory destination
+        ea_addr = self._ea_addr(ops[0])
+        return (f'{{ uint32_t _ea = {ea_addr}; uint{size}_t _tmp = bus_read{size}(_ea); '
+                f'M68K_{op}{size}(_tmp); bus_write{size}(_ea, _tmp); }}')
 
     def _gen_tst(self, ops, size):
         val = self._ea_read(ops[0], size)
@@ -658,21 +929,30 @@ class M68KTranslator:
         r = self._reg(ops[1])
         if r:
             return f'M68K_BSET32({r}, {bit});'
-        return None
+        # Memory: byte-size BSET
+        ea_addr = self._ea_addr(ops[1])
+        return (f'{{ uint32_t _ea = {ea_addr}; uint8_t _b = 1u << (({bit}) & 7); uint8_t _v = bus_read8(_ea); '
+                f'g_m68k.flag_Z = !(_v & _b); bus_write8(_ea, _v | _b); }}')
 
     def _gen_bclr(self, ops):
         bit = self._ea_read(ops[0], 32)
         r = self._reg(ops[1])
         if r:
             return f'M68K_BCLR32({r}, {bit});'
-        return None
+        # Memory: byte-size BCLR
+        ea_addr = self._ea_addr(ops[1])
+        return (f'{{ uint32_t _ea = {ea_addr}; uint8_t _b = 1u << (({bit}) & 7); uint8_t _v = bus_read8(_ea); '
+                f'g_m68k.flag_Z = !(_v & _b); bus_write8(_ea, _v & ~_b); }}')
 
     def _gen_bchg(self, ops):
         bit = self._ea_read(ops[0], 32)
         r = self._reg(ops[1])
         if r:
             return f'M68K_BCHG32({r}, {bit});'
-        return None
+        # Memory: byte-size BCHG
+        ea_addr = self._ea_addr(ops[1])
+        return (f'{{ uint32_t _ea = {ea_addr}; uint8_t _b = 1u << (({bit}) & 7); uint8_t _v = bus_read8(_ea); '
+                f'g_m68k.flag_Z = !(_v & _b); bus_write8(_ea, _v ^ _b); }}')
 
     def _gen_shift(self, op, ops, size):
         if len(ops) == 2:
@@ -680,14 +960,29 @@ class M68KTranslator:
             r = self._reg(ops[1])
             if r:
                 return f'M68K_{op}{size}({r}, {cnt});'
+            # Memory destination
+            ea_addr = self._ea_addr(ops[1])
+            return (f'{{ uint32_t _ea = {ea_addr}; uint{size}_t _tmp = bus_read{size}(_ea); '
+                    f'M68K_{op}{size}(_tmp, {cnt}); bus_write{size}(_ea, _tmp); }}')
+        elif len(ops) == 1:
+            # Memory shift by 1 (e.g. LSL.W (An))
+            ea_addr = self._ea_addr(ops[0])
+            return (f'{{ uint32_t _ea = {ea_addr}; uint16_t _tmp = bus_read16(_ea); '
+                    f'M68K_{op}16(_tmp, 1); bus_write16(_ea, _tmp); }}')
         return None
+
+    def _is_local_target(self, target):
+        """Check if target address is within current function."""
+        return self.func_start <= target < self.func_end
 
     def _gen_bra(self, ops, addr):
         target = self._parse_branch_target(ops[0])
-        label = self.labels.get(target, f'loc_{target:06X}')
-        if label.startswith('loc_'):
+        if target is not None and self._is_local_target(target):
+            label = self.labels.get(target, f'loc_{target:06X}')
             return f'goto {label};'
-        return f'{{ {label}(); return; }}'
+        if target is not None:
+            return f'{{ func_table_call(0x{target:06X}); return; }}'
+        return f'/* BRA unresolved */'
 
     def _gen_bsr(self, ops, addr):
         target = self._parse_branch_target(ops[0])
@@ -701,6 +996,10 @@ class M68KTranslator:
             if label.startswith('loc_'):
                 return f'goto {label};'
             return f'{{ {label}(); return; }}'
+        # True indirect JMP through register/EA
+        ea_addr = self._ea_addr(ops[0])
+        if 'UNHANDLED' not in ea_addr:
+            return f'{{ func_table_call({ea_addr}); return; }} /* JMP indirect via {ops[0]} */'
         return f'/* JMP indirect: {ops[0]} — TODO */'
 
     def _gen_jsr(self, ops, addr):
@@ -708,37 +1007,58 @@ class M68KTranslator:
         if target is not None:
             label = self.labels.get(target, f'sub_{target:06X}')
             return f'func_table_call(0x{target:06X}); /* {label} */'
+        # True indirect JSR through register/EA
+        ea_addr = self._ea_addr(ops[0])
+        if 'UNHANDLED' not in ea_addr:
+            return f'func_table_call({ea_addr}); /* JSR indirect via {ops[0]} */'
         return f'/* JSR indirect: {ops[0]} — TODO */'
 
     def _gen_bcc(self, cc_macro, ops, addr):
         target = self._parse_branch_target(ops[0])
-        label = self.labels.get(target, f'loc_{target:06X}')
-        if label.startswith('loc_'):
+        if target is not None and self._is_local_target(target):
+            label = self.labels.get(target, f'loc_{target:06X}')
             return f'if ({cc_macro}) goto {label};'
-        return f'if ({cc_macro}) {{ {label}(); return; }}'
+        if target is not None:
+            return f'if ({cc_macro}) {{ func_table_call(0x{target:06X}); return; }}'
+        return f'/* Bcc unresolved */'
 
     def _gen_scc(self, cc_macro, ops):
         r = self._reg(ops[0])
         if r:
             return f'{r} = ({r} & 0xFFFFFF00u) | ({cc_macro} ? 0xFFu : 0x00u);'
-        return None
+        # Memory destination
+        ea_addr = self._ea_addr(ops[0])
+        return f'bus_write8({ea_addr}, {cc_macro} ? 0xFF : 0x00);'
 
     def _gen_dbcc(self, cc_macro, ops, addr):
         r = self._reg(ops[0])
         target = self._parse_branch_target(ops[1]) if len(ops) > 1 else None
         if r and target is not None:
-            label = self.labels.get(target, f'loc_{target:06X}')
-            if cc_macro == '0':
-                # DBRA: always decrement and branch if != -1
-                return f'{{ int16_t _cnt = (int16_t)(uint16_t){r}; _cnt--; {r} = ({r} & 0xFFFF0000u) | (uint16_t)_cnt; if (_cnt != -1) goto {label}; }}'
-            return f'if (!({cc_macro})) {{ int16_t _cnt = (int16_t)(uint16_t){r}; _cnt--; {r} = ({r} & 0xFFFF0000u) | (uint16_t)_cnt; if (_cnt != -1) goto {label}; }}'
+            if self._is_local_target(target):
+                label = self.labels.get(target, f'loc_{target:06X}')
+                if cc_macro == '0':
+                    return f'{{ int16_t _cnt = (int16_t)(uint16_t){r}; _cnt--; {r} = ({r} & 0xFFFF0000u) | (uint16_t)_cnt; if (_cnt != -1) goto {label}; }}'
+                return f'if (!({cc_macro})) {{ int16_t _cnt = (int16_t)(uint16_t){r}; _cnt--; {r} = ({r} & 0xFFFF0000u) | (uint16_t)_cnt; if (_cnt != -1) goto {label}; }}'
+            else:
+                # Cross-function DBcc — emit as call
+                if cc_macro == '0':
+                    return f'{{ int16_t _cnt = (int16_t)(uint16_t){r}; _cnt--; {r} = ({r} & 0xFFFF0000u) | (uint16_t)_cnt; if (_cnt != -1) {{ func_table_call(0x{target:06X}); return; }} }}'
+                return f'if (!({cc_macro})) {{ int16_t _cnt = (int16_t)(uint16_t){r}; _cnt--; {r} = ({r} & 0xFFFF0000u) | (uint16_t)_cnt; if (_cnt != -1) {{ func_table_call(0x{target:06X}); return; }} }}'
         return None
 
     def _gen_st(self, ops):
-        return self._ea_write(ops[0], 8, '0xFF')
+        r = self._reg(ops[0])
+        if r:
+            return f'{r} = ({r} & 0xFFFFFF00u) | 0xFFu;'
+        ea_addr = self._ea_addr(ops[0])
+        return f'bus_write8({ea_addr}, 0xFF);'
 
     def _gen_sf(self, ops):
-        return self._ea_write(ops[0], 8, '0x00')
+        r = self._reg(ops[0])
+        if r:
+            return f'{r} = ({r} & 0xFFFFFF00u);'
+        ea_addr = self._ea_addr(ops[0])
+        return f'bus_write8({ea_addr}, 0x00);'
 
     def _gen_move_sr(self, ops, mnemonic):
         if 'sr' in ops[0].lower():
@@ -759,14 +1079,16 @@ class M68KTranslator:
 
     def _parse_branch_target(self, op):
         op = op.strip()
-        if op.startswith('$'):
+        # $XXXX or $XXXX.l or $XXXX.w
+        m = re.match(r'^\$([0-9A-Fa-f]+)(?:\.(w|l))?$', op)
+        if m:
             try:
-                return int(op[1:], 16)
+                return int(m.group(1), 16)
             except ValueError:
                 return None
         if op.startswith('0x'):
             try:
-                return int(op, 16)
+                return int(op.split('.')[0], 16)
             except ValueError:
                 return None
         # Absolute with parens: ($XXXX).l
@@ -788,6 +1110,11 @@ class CodeGenerator:
         self.analyzer = analyzer
         self.translator = translator
         self.output_dir = output_dir
+        # Clean old generated files before writing new ones
+        if os.path.exists(output_dir):
+            for f in os.listdir(output_dir):
+                if f.startswith('recomp_') and f.endswith('.c'):
+                    os.remove(os.path.join(output_dir, f))
         os.makedirs(output_dir, exist_ok=True)
 
     def generate_all(self):
@@ -858,7 +1185,7 @@ class CodeGenerator:
             if addr not in self.analyzer.instructions:
                 continue
             mnemonic, op_str, size, raw = self.analyzer.instructions[addr]
-            c_lines = self.translator.translate_instruction(addr, mnemonic, op_str, raw, start)
+            c_lines = self.translator.translate_instruction(addr, mnemonic, op_str, raw, start, end)
             lines.extend(c_lines)
 
         # Ensure function has a return (if original didn't end with RTS)
@@ -866,7 +1193,30 @@ class CodeGenerator:
             lines.append(f'    /* WARNING: function did not end with RTS */')
 
         lines.append(f'}}')
-        return lines
+
+        # Post-process: fix cross-function gotos
+        # Collect all labels defined in this function
+        defined_labels = set()
+        for line in lines:
+            stripped = line.strip()
+            if stripped.endswith(':') and not stripped.startswith('/*') and not stripped.startswith('//'):
+                label_name = stripped[:-1]
+                defined_labels.add(label_name)
+
+        # Replace gotos to undefined labels with func_table_call
+        fixed_lines = []
+        for line in lines:
+            # Match goto to loc_XXXXXX or sub_XXXXXX or jt_XXXXXX or vec_XXXXXX
+            m = re.search(r'goto ((?:loc|sub|jt|vec)_([0-9A-Fa-f]+));', line)
+            if m and m.group(1) not in defined_labels:
+                addr_val = int(m.group(2), 16)
+                line = line.replace(
+                    f'goto {m.group(1)};',
+                    f'{{ func_table_call(0x{addr_val:06X}); return; }}'
+                )
+            fixed_lines.append(line)
+
+        return fixed_lines
 
     def _generate_registration(self, functions):
         """Generate the header with forward declarations and registration function."""
@@ -876,6 +1226,16 @@ class CodeGenerator:
         lines.append('#define RECOMP_FUNCS_H')
         lines.append('')
         lines.append('#include <genrecomp/genrecomp.h>')
+        lines.append('')
+        # MSVC-compatible helpers for post-increment/pre-decrement addressing modes
+        lines.append('/* Post-increment read: read from (An) then An += size */')
+        for sz in [8, 16, 32]:
+            inc = sz // 8
+            lines.append(f'static inline uint{sz}_t _postinc{sz}(int n) {{ uint{sz}_t v = bus_read{sz}(g_m68k.a[n]); g_m68k.a[n] += {inc}; return v; }}')
+        lines.append('/* Pre-decrement read: An -= size then read from (An) */')
+        for sz in [8, 16, 32]:
+            dec = sz // 8
+            lines.append(f'static inline uint{sz}_t _predec{sz}(int n) {{ g_m68k.a[n] -= {dec}; return bus_read{sz}(g_m68k.a[n]); }}')
         lines.append('')
 
         # Forward declarations
@@ -993,6 +1353,41 @@ def main():
     print("\n--- Phase 1: Analysis ---")
     analyzer = M68KAnalyzer(rom)
     analyzer.analyze()
+
+    # Phase 1.5: discover additional entry points from cross-function calls
+    # that reference addresses not in any discovered function
+    extra_entries = set()
+    for func in analyzer.functions.values():
+        for call_addr in func['calls']:
+            if call_addr not in analyzer.functions and 0x200 <= call_addr < rom.size:
+                extra_entries.add(call_addr)
+    # Also scan generated code patterns for func_table_call references
+    for addr, (mnemonic, op_str, size, raw) in analyzer.instructions.items():
+        if mnemonic in ('jmp', 'jsr', 'bra', 'bsr'):
+            target = analyzer._extract_branch_target(
+                type('obj', (), {'op_str': op_str, 'operands': [], 'mnemonic': mnemonic})(),
+                addr
+            )
+            if target and target not in analyzer.functions and 0x200 <= target < rom.size and not (target & 1):
+                extra_entries.add(target)
+
+    if extra_entries:
+        print(f"\n--- Phase 1.5: Discovering {len(extra_entries)} additional functions ---")
+        work = list(extra_entries)
+        while work:
+            new_work = []
+            for addr in work:
+                if addr in analyzer.visited or addr >= rom.size or addr < 0x200 or (addr & 1):
+                    continue
+                new_targets = analyzer._disassemble_block(addr)
+                for target, is_call in new_targets:
+                    if target not in analyzer.visited and 0x200 <= target < rom.size and not (target & 1):
+                        new_work.append(target)
+                        if is_call:
+                            extra_entries.add(target)
+            work = new_work
+        analyzer._build_functions(extra_entries | set(analyzer.functions.keys()))
+        print(f"Now have {len(analyzer.functions)} functions, {len(analyzer.instructions)} instructions")
 
     print("\n--- Phase 2: Code Generation ---")
     translator = M68KTranslator(rom, analyzer.labels)

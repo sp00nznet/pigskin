@@ -29,27 +29,34 @@ Think NFL Blitz meets Dungeons & Dragons. On a Sega Genesis. In 1992.
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| ROM Analysis | **Done** | 327 functions, 19,177 instructions discovered |
-| Code Generation | **Done** | 23,745 lines of recompiled C across 7 source files |
-| Function Registration | **Done** | All 327 functions registered in dispatch table |
+| ROM Analysis | **Done** | 328 functions, 19,209 instructions discovered |
+| Code Generation | **Done** | ~24K lines of recompiled C across 7 source files |
+| Function Registration | **Done** | All 328 functions registered in dispatch table |
 | Entry Point | **Done** | Genesis init -> main game loop wired up |
 | VBlank Handler | **Done** | IRQ6 handler ($0E9220) connected |
 | Jump Table Discovery | **Done** | 61 jump tables, 209 targets found |
-| Build System | **Done** | CMake, links against genrecomp |
-| MOVEM Support | **In Progress** | Register save/restore needs per-instruction handling |
-| Indirect JSR/JMP | **In Progress** | Some calls go through RAM pointers |
-| Full Gameplay | **Not Yet** | Need to validate frame loop + input |
+| Build System | **Done** | CMake + MSVC, links against genrecomp |
+| MOVEM Support | **Done** | Full register list parsing, push/pop/load/store |
+| Indirect JSR/JMP | **Done** | 14 genuine indirect calls through address registers |
+| Memory-dest Ops | **Done** | ADD/SUB/AND/OR/BCLR/etc. to memory addresses |
+| MSVC Compat | **Done** | No GCC extensions, builds clean on MSVC 2022 |
+| Cross-func Branches | **Done** | Auto-detected and converted to func_table_call |
+| Compilation | **Done** | Compiles + links to 2.5MB native .exe |
+| Full Gameplay | **Not Yet** | Stub functions need recompilation, runtime testing |
 
 ### Code Coverage
 
 ```
 ROM Size:        1,048,576 bytes (1024 KB)
-Code Discovered:    80,046 bytes (78 KB, 7.6% of ROM)
-Data (gfx/snd):   ~968,530 bytes (946 KB, 92.4% of ROM)
-Functions:              327
-Instructions:        19,177
+Code Discovered:    ~80 KB (7.6% of ROM)
+Data (gfx/snd):   ~946 KB (92.4% of ROM)
+Functions:              328
+Instructions:        19,209
 Call Edges:             157
 Jump Tables:             61
+Native Binary:      2.5 MB (.exe)
+Compile Errors:         0
+Link Errors:            0 (4 stubs for undiscovered functions)
 ```
 
 The ROM is mostly data -- graphics tiles, sprite data, sound samples, level layouts. The actual game logic is compact, which tracks for a 1992 Genesis sports game.
@@ -190,9 +197,13 @@ Built on the [genrecomp](https://github.com/sp00nznet/genrecomp) toolkit, which 
 
 ## What's Next
 
-- [ ] Implement MOVEM (register list save/restore) -- about 50 instructions
-- [ ] Resolve indirect JSR/JMP calls through RAM function pointers
-- [ ] Validate the main game loop frame timing
+- [x] ~~Implement MOVEM~~ -- Done! Full register list parsing
+- [x] ~~Resolve indirect JSR/JMP~~ -- Done! 14 genuine indirect calls handled
+- [x] ~~Memory-destination operations~~ -- Done! ADD/SUB/AND/OR/BCLR/etc. to memory
+- [x] ~~MSVC compatibility~~ -- Done! Builds clean on Visual Studio 2022
+- [x] ~~Cross-function branch detection~~ -- Done! Auto-converted to func_table_call
+- [x] ~~Compile + link~~ -- Done! 2.5MB native executable
+- [ ] Recompile the 4 stub functions ($0E8FE0, $0EAD36, $0FB294, $0FB1C2)
 - [ ] Test with a Genesis emulator side-by-side for comparison debugging
 - [ ] Map RAM addresses to meaningful variable names
 - [ ] Identify and label game subsystems (rendering, input, AI, sound)

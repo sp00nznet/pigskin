@@ -300,6 +300,8 @@ class M68KAnalyzer:
                 if target is not None:
                     self.xrefs_to[target].add(addr)
                     targets.append((target, False))
+                    if target not in self.labels:
+                        self.labels[target] = f"loc_{target:06X}"
                 addr += insn.size
                 continue
 
@@ -311,6 +313,20 @@ class M68KAnalyzer:
     def _extract_branch_target(self, insn, addr):
         """Extract absolute target address from branch/call instruction."""
         op_str = insn.op_str.strip()
+
+        # For DBcc: target is after the comma (e.g. "d1, $238")
+        if ',' in op_str and insn.mnemonic.lower().startswith('db'):
+            target_part = op_str.split(',', 1)[1].strip()
+            if target_part.startswith('$'):
+                try:
+                    return int(target_part[1:], 16) & 0xFFFFFF
+                except ValueError:
+                    pass
+            if target_part.startswith('0x'):
+                try:
+                    return int(target_part, 16) & 0xFFFFFF
+                except ValueError:
+                    pass
 
         if op_str.startswith('$'):
             try:
