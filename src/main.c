@@ -1,14 +1,46 @@
 /*
  * Pigskin Footbrawl -- Statically Recompiled
- * Auto-generated main entry point
  *
  * Original ROM: PIGSKIN ((C) RSI 1992.SEP)
+ *
+ * This game uses a TRAP-based cooperative task scheduler. The game's main
+ * loop runs INSIDE entry_point() and never returns — it yields via TRAP #0
+ * (wait for VBlank) and TRAP #4 (yield to scheduler). The VBlank callback
+ * handles frame rendering and SDL event pumping.
  */
 
 #include <genrecomp/genrecomp.h>
 #include <genrecomp/bus.h>
 #include "recomp/recomp_funcs.h"
 #include <stdio.h>
+
+static int s_frame_count = 0;
+
+/* VBlank callback — called from bus_tick_cycles when the simulated
+ * scanline counter crosses the active display boundary.
+ *
+ * IMPORTANT: This runs inside bus_tick_cycles with a reentrancy guard,
+ * so we can't call genrecomp_end_frame() here (it does bus accesses
+ * that would re-enter). Instead, just run the game's VBlank handler
+ * and set a flag for frame rendering. Frame rendering happens in a
+ * separate hook. */
+static void pigskin_vblank(void) {
+    /* Run the game's VBlank handler (increments frame counters) */
+    vec_irq6_vblank();
+
+    /* Poll SDL events (must happen periodically to keep window responsive) */
+    if (!genrecomp_begin_frame()) {
+        printf("\nWindow closed, exiting.\n");
+        genrecomp_shutdown();
+        exit(0);
+    }
+
+    s_frame_count++;
+    if (s_frame_count <= 5 || (s_frame_count % 300 == 0)) {
+        printf("VBlank %d\n", s_frame_count);
+        fflush(stdout);
+    }
+}
 
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
@@ -33,38 +65,24 @@ int main(int argc, char *argv[]) {
     recomp_register_all();
     printf("Registered %d recompiled functions\n\n", 1164);
 
-    /* Register VBlank callback so VBlank-driven counters advance
-     * during tight polling loops (TRAP #0 wait-for-VBlank etc.) */
-    bus_set_vblank_callback(vec_irq6_vblank);
+    /* Register VBlank callback — this drives the entire frame loop
+     * since the game never returns from entry_point(). */
+    bus_set_vblank_callback(pigskin_vblank);
 
     /* Set initial CPU state */
     g_m68k.a[7] = 0xFFFD00;
     g_m68k.pc = 0x000200;
     m68k_set_sr(0x2700); /* supervisor mode, all interrupts masked */
 
-    /* Run initialization (original entry point at $000200) */
-    printf("Running entry_point()...\n");
+    /* Run the game. This call never returns — the game's main loop
+     * runs inside via TRAP-based cooperative scheduling, with frame
+     * rendering handled by the VBlank callback above. */
+    printf("Starting game...\n");
     fflush(stdout);
     entry_point();
-    printf("entry_point() returned, entering main loop\n");
-    fflush(stdout);
 
-    /* Main game loop */
-    int frame = 0;
-    while (genrecomp_begin_frame()) {
-        /* Trigger VBlank and run VBlank handler */
-        genrecomp_trigger_vblank();
-        vec_irq6_vblank();
-
-        genrecomp_end_frame();
-
-        if (frame < 10 || (frame % 60 == 0)) {
-            printf("Frame %d complete\n", frame);
-            fflush(stdout);
-        }
-        frame++;
-    }
-
+    /* If we somehow get here, clean up */
+    printf("entry_point() returned unexpectedly\n");
     genrecomp_shutdown();
     return 0;
 }

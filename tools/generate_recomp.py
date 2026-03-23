@@ -256,7 +256,9 @@ class M68KTranslator:
 
         # ---- TRAP ----
         if base == 'trap':
-            return f'recomp_m68k_exception({self._imm(ops[0])}); /* TRAP */'
+            # TRAP #N uses vector 32+N (address (32+N)*4 in vector table)
+            trap_num = self._imm(ops[0])
+            return f'recomp_m68k_exception(32 + {trap_num}); /* TRAP #{trap_num} */'
 
         return None  # unhandled
 
@@ -1136,7 +1138,7 @@ class CodeGenerator:
         # Generate each chunk (first pass — discovers cross-function targets)
         all_func_names = []
         for chunk_name, chunk_funcs in chunks:
-            self._generate_chunk(chunk_name, chunk_funcs)
+            self._generate_chunk(chunk_name, chunk_funcs, functions)
             for f in chunk_funcs:
                 all_func_names.append(f['name'])
 
@@ -1168,7 +1170,7 @@ class CodeGenerator:
             self.cross_func_targets.clear()
             all_func_names = []
             for chunk_name, chunk_funcs in chunks:
-                self._generate_chunk(chunk_name, chunk_funcs)
+                self._generate_chunk(chunk_name, chunk_funcs, functions)
                 for f in chunk_funcs:
                     all_func_names.append(f['name'])
             print(f"    Now have {len(functions)} functions")
@@ -1182,7 +1184,7 @@ class CodeGenerator:
         print(f"\nGenerated {len(chunks)} source files with {len(functions)} functions")
         print(f"Output directory: {self.output_dir}")
 
-    def _generate_chunk(self, chunk_name, funcs):
+    def _generate_chunk(self, chunk_name, funcs, all_functions=None):
         """Generate one C source file for a chunk of functions."""
         lines = []
         lines.append(f'/* Auto-generated recompiled code for Pigskin Footbrawl */')
@@ -1193,15 +1195,22 @@ class CodeGenerator:
         lines.append(f'#include "recomp_funcs.h"')
         lines.append(f'')
 
+        # Build a map from function start -> next function for fall-through
+        next_func_map = {}
+        if all_functions:
+            for i in range(len(all_functions) - 1):
+                next_func_map[all_functions[i]['start']] = all_functions[i + 1]
+
         for func in funcs:
-            lines.extend(self._generate_function(func))
+            next_func = next_func_map.get(func['start'])
+            lines.extend(self._generate_function(func, next_func))
             lines.append('')
 
         path = os.path.join(self.output_dir, f'{chunk_name}.c')
         with open(path, 'w') as f:
             f.write('\n'.join(lines))
 
-    def _generate_function(self, func):
+    def _generate_function(self, func, next_func=None):
         """Generate C code for one function."""
         lines = []
         name = func['name']
@@ -1224,9 +1233,15 @@ class CodeGenerator:
             c_lines = self.translator.translate_instruction(addr, mnemonic, op_str, raw, start, end)
             lines.extend(c_lines)
 
-        # Ensure function has a return (if original didn't end with RTS)
-        if not func['has_return']:
-            lines.append(f'    /* WARNING: function did not end with RTS */')
+        # If function didn't end with RTS/RTE/JMP/BRA, it falls through to the
+        # next function. Generate a call to the next function so execution continues.
+        # Skip if the last emitted line already returns (e.g. func_table_call + return).
+        if not func['has_return'] and next_func:
+            last_code = lines[-1].strip() if lines else ''
+            if 'return;' not in last_code:
+                next_name = next_func['name']
+                lines.append(f'    /* Fall through to next function */')
+                lines.append(f'    {next_name}();')
 
         lines.append(f'}}')
 
