@@ -104,6 +104,23 @@ class M68KAnalyzer:
         self.labels = {}
         self.jump_tables = {}           # addr -> list of target addrs
 
+    # Explicit seed addresses for functions not reachable by static analysis.
+    # These are discovered through manual inspection of the ROM (indirect jumps,
+    # PC-relative calls, computed addresses, etc.)
+    EXPLICIT_SEEDS = {
+        0x0E8FE0: "main_game_entry",     # JMP target from init (via register)
+        0x0EAD36: "sub_0EAD36",          # Starts with RTS
+        0x0FB294: "sub_0FB294",          # Starts with MOVEM, game logic
+        0x0FB1C2: "sub_0FB1C2",          # Starts with MOVE.W, game logic
+        # BSR/JSR targets not found by recursive descent
+        0x0F8452: "sub_0F8452",
+        0x0F970C: "sub_0F970C",
+        0x0F9C9C: "sub_0F9C9C",
+        0x0F9E2E: "sub_0F9E2E",
+        0x0FA2D4: "sub_0FA2D4",
+        0x0FA14A: "sub_0FA14A",
+    }
+
     def analyze(self):
         """Run full analysis."""
         # Gather initial entry points
@@ -113,6 +130,12 @@ class M68KAnalyzer:
             entry_points.add(addr)
             self.labels[addr] = f"vec_{name}"
         self.labels[self.rom.initial_pc] = "entry_point"
+
+        # Add explicit seeds for functions unreachable by recursive descent
+        for addr, name in self.EXPLICIT_SEEDS.items():
+            entry_points.add(addr)
+            self.labels[addr] = name
+        print(f"Added {len(self.EXPLICIT_SEEDS)} explicit seed functions")
 
         # Scan ROM for lea-based jump tables and inline address tables
         jt_targets = self._scan_jump_tables()
@@ -148,6 +171,25 @@ class M68KAnalyzer:
             print(f"  Found {len(more_targets)} additional targets from address-loading instructions")
             work = list(more_targets - self.visited)
             all_func_entries.update(more_targets)
+            while work:
+                new_work = []
+                for addr in work:
+                    if addr in self.visited or addr >= self.rom.size or addr < 0x200 or (addr & 1):
+                        continue
+                    new_targets = self._disassemble_block(addr)
+                    for target, is_call in new_targets:
+                        if target not in self.visited and 0x200 <= target < self.rom.size and not (target & 1):
+                            new_work.append(target)
+                            if is_call:
+                                all_func_entries.add(target)
+                work = new_work
+
+        # Prologue scan: find LINK/MOVEM patterns in unvisited ROM
+        prologue_targets = self._scan_prologues()
+        if prologue_targets:
+            print(f"  Found {len(prologue_targets)} prologue-pattern functions in unvisited ROM")
+            work = list(prologue_targets - self.visited)
+            all_func_entries.update(prologue_targets)
             while work:
                 new_work = []
                 for addr in work:
@@ -220,6 +262,33 @@ class M68KAnalyzer:
                         targets.add(val)
                 except (ValueError, IndexError):
                     pass
+        return targets - self.visited
+
+    def _scan_prologues(self):
+        """Scan unvisited ROM for common function prologue patterns.
+
+        Looks for LINK A5/A6 ($4E55/$4E56) and MOVEM.L regs,-(SP) ($48E7)
+        at even addresses in the code area that haven't been visited yet.
+        Borrowed from CPS1 recomp's approach.
+        """
+        targets = set()
+        rom = self.rom
+        code_start = 0x0E0000  # Pigskin code area
+        i = code_start
+        while i < rom.size - 4:
+            if i not in self.visited and (i & 1) == 0:
+                word = rom.read16(i)
+                if word in (0x4E55, 0x4E56):
+                    # LINK A5/A6 — classic function prologue
+                    targets.add(i)
+                    if i not in self.labels:
+                        self.labels[i] = f"sub_{i:06X}"
+                elif word == 0x48E7:
+                    # MOVEM.L regs,-(SP) — register save prologue
+                    targets.add(i)
+                    if i not in self.labels:
+                        self.labels[i] = f"sub_{i:06X}"
+            i += 2
         return targets - self.visited
 
     def _parse_absolute_addr(self, op_str):

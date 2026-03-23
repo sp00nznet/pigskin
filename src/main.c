@@ -6,6 +6,7 @@
  */
 
 #include <genrecomp/genrecomp.h>
+#include <genrecomp/bus.h>
 #include "recomp/recomp_funcs.h"
 #include <stdio.h>
 
@@ -30,7 +31,11 @@ int main(int argc, char *argv[]) {
 
     /* Register all recompiled functions */
     recomp_register_all();
-    printf("Registered %d recompiled functions\n\n", 327);
+    printf("Registered %d recompiled functions\n\n", 1164);
+
+    /* Register VBlank callback so VBlank-driven counters advance
+     * during tight polling loops (TRAP #0 wait-for-VBlank etc.) */
+    bus_set_vblank_callback(vec_irq6_vblank);
 
     /* Set initial CPU state */
     g_m68k.a[7] = 0xFFFD00;
@@ -38,15 +43,26 @@ int main(int argc, char *argv[]) {
     m68k_set_sr(0x2700); /* supervisor mode, all interrupts masked */
 
     /* Run initialization (original entry point at $000200) */
+    printf("Running entry_point()...\n");
+    fflush(stdout);
     entry_point();
+    printf("entry_point() returned, entering main loop\n");
+    fflush(stdout);
 
     /* Main game loop */
+    int frame = 0;
     while (genrecomp_begin_frame()) {
         /* Trigger VBlank and run VBlank handler */
         genrecomp_trigger_vblank();
         vec_irq6_vblank();
 
         genrecomp_end_frame();
+
+        if (frame < 10 || (frame % 60 == 0)) {
+            printf("Frame %d complete\n", frame);
+            fflush(stdout);
+        }
+        frame++;
     }
 
     genrecomp_shutdown();

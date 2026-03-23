@@ -918,10 +918,12 @@ class M68KTranslator:
 
     def _gen_btst(self, ops):
         bit = self._ea_read(ops[0], 32)
-        val = self._ea_read(ops[1], 32)
         r = self._reg(ops[1])
         if r:
+            # Register: BTST operates on full 32 bits
             return f'M68K_BTST32({r}, {bit});'
+        # Memory: BTST always operates on a byte regardless of Capstone suffix
+        val = self._ea_read(ops[1], 8)
         return f'M68K_BTST8({val}, {bit});'
 
     def _gen_bset(self, ops):
@@ -1110,6 +1112,7 @@ class CodeGenerator:
         self.analyzer = analyzer
         self.translator = translator
         self.output_dir = output_dir
+        self.cross_func_targets = set()  # addresses used by func_table_call
         # Clean old generated files before writing new ones
         if os.path.exists(output_dir):
             for f in os.listdir(output_dir):
@@ -1130,18 +1133,51 @@ class CodeGenerator:
             chunk_name = f"recomp_{chunk_start:06X}_{chunk_end:06X}"
             chunks.append((chunk_name, chunk))
 
-        # Generate each chunk
+        # Generate each chunk (first pass — discovers cross-function targets)
         all_func_names = []
         for chunk_name, chunk_funcs in chunks:
             self._generate_chunk(chunk_name, chunk_funcs)
             for f in chunk_funcs:
                 all_func_names.append(f['name'])
 
+        # Iteratively resolve cross-function call targets until stable.
+        # Each pass may discover new targets from newly-split functions.
+        for iteration in range(10):  # safety limit
+            unregistered = self.cross_func_targets - set(f['start'] for f in functions)
+            # Filter to valid ROM addresses
+            unregistered = {a for a in unregistered if 0x200 <= a < self.rom.size and not (a & 1)}
+            if not unregistered:
+                break
+            print(f"  Pass {iteration+1}: {len(unregistered)} cross-function targets — splitting and regenerating...")
+            for addr in unregistered:
+                if addr not in self.analyzer.labels:
+                    self.analyzer.labels[addr] = f'loc_{addr:06X}'
+            all_entries = set(f['start'] for f in functions) | unregistered
+            self.analyzer._build_functions(all_entries)
+            functions = sorted(self.analyzer.functions.values(), key=lambda f: f['start'])
+            chunks = []
+            for i in range(0, len(functions), self.MAX_FUNCS_PER_FILE):
+                chunk = functions[i:i + self.MAX_FUNCS_PER_FILE]
+                chunk_start = chunk[0]['start']
+                chunk_end = chunk[-1]['end']
+                chunk_name = f"recomp_{chunk_start:06X}_{chunk_end:06X}"
+                chunks.append((chunk_name, chunk))
+            for f_name in os.listdir(self.output_dir):
+                if f_name.startswith('recomp_') and f_name.endswith('.c'):
+                    os.remove(os.path.join(self.output_dir, f_name))
+            self.cross_func_targets.clear()
+            all_func_names = []
+            for chunk_name, chunk_funcs in chunks:
+                self._generate_chunk(chunk_name, chunk_funcs)
+                for f in chunk_funcs:
+                    all_func_names.append(f['name'])
+            print(f"    Now have {len(functions)} functions")
+
         # Generate registration header
         self._generate_registration(functions)
 
-        # Generate main entry point
-        self._generate_main(functions)
+        # Skip main.c generation — hand-written src/main.c is used instead
+        # self._generate_main(functions)
 
         print(f"\nGenerated {len(chunks)} source files with {len(functions)} functions")
         print(f"Output directory: {self.output_dir}")
@@ -1206,15 +1242,21 @@ class CodeGenerator:
         # Replace gotos to undefined labels with func_table_call
         fixed_lines = []
         for line in lines:
-            # Match goto to loc_XXXXXX or sub_XXXXXX or jt_XXXXXX or vec_XXXXXX
-            m = re.search(r'goto ((?:loc|sub|jt|vec)_([0-9A-Fa-f]+));', line)
+            m = re.search(r'goto ((?:loc|sub|jt|vec|main_game_entry)_?([0-9A-Fa-f]+));', line)
             if m and m.group(1) not in defined_labels:
                 addr_val = int(m.group(2), 16)
+                self.cross_func_targets.add(addr_val)
                 line = line.replace(
                     f'goto {m.group(1)};',
                     f'{{ func_table_call(0x{addr_val:06X}); return; }}'
                 )
             fixed_lines.append(line)
+
+        # Also track all func_table_call targets already in the code
+        # (from translator's _gen_bsr, _gen_bcc, etc.)
+        for line in fixed_lines:
+            for m in re.finditer(r'func_table_call\(0x([0-9A-Fa-f]+)\)', line):
+                self.cross_func_targets.add(int(m.group(1), 16))
 
         return fixed_lines
 
