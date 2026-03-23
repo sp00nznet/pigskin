@@ -119,6 +119,14 @@ class M68KAnalyzer:
         0x0F9E2E: "sub_0F9E2E",
         0x0FA2D4: "sub_0FA2D4",
         0x0FA14A: "sub_0FA14A",
+        # TRAP handler vectors (reached via TRAP instruction, not JSR/BSR)
+        0x0E8E4A: "trap1_handler",
+        0x0E8E60: "trap2_handler",
+        0x0E8E62: "trap3_handler",
+        0x0E8E68: "trap4_handler",       # Main task scheduler — 76 call sites!
+        0x0E8F80: "trap5_handler",
+        0x0E8F8E: "trap6_handler",
+        0x0E8F90: "trap7_handler",
     }
 
     def analyze(self):
