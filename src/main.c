@@ -35,9 +35,15 @@ static void pigskin_vblank(void) {
         exit(0);
     }
 
+    /* Render VDP output and present frame.
+     * Skip first few frames to let VDP state stabilize. */
+    if (0) { /* skip rendering for now */
+        genrecomp_end_frame();
+    }
+
     s_frame_count++;
-    if (s_frame_count <= 5 || (s_frame_count % 300 == 0)) {
-        printf("VBlank %d\n", s_frame_count);
+    if (s_frame_count <= 10 || (s_frame_count % 60 == 0)) {
+        printf("Frame %d (SP=$%08X)\n", s_frame_count, g_m68k.a[7]);
         fflush(stdout);
     }
 }
