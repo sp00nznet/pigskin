@@ -37,9 +37,8 @@ static void pigskin_vblank(void) {
 
     /* Render VDP output and present frame.
      * Skip first few frames to let VDP state stabilize. */
-    if (0) { /* skip rendering for now */
-        genrecomp_end_frame();
-    }
+    /* Render VDP output and present frame */
+    genrecomp_end_frame();
 
     s_frame_count++;
     if (s_frame_count <= 10 || (s_frame_count % 60 == 0)) {
@@ -74,6 +73,7 @@ int main(int argc, char *argv[]) {
     /* Register VBlank callback — this drives the entire frame loop
      * since the game never returns from entry_point(). */
     bus_set_vblank_callback(pigskin_vblank);
+
 
     /* Set initial CPU state */
     g_m68k.a[7] = 0xFFFD00;

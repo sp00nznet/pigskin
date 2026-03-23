@@ -1237,8 +1237,15 @@ class CodeGenerator:
         # next function. Generate a call to the next function so execution continues.
         # Skip if the last emitted line already returns (e.g. func_table_call + return).
         if not func['has_return'] and next_func:
+            # Check if the last line is an unconditional return/jump.
+            # Conditional returns (inside if) still need fall-through.
             last_code = lines[-1].strip() if lines else ''
-            if 'return;' not in last_code:
+            needs_fallthrough = True
+            if last_code == 'return;' or last_code == 'return; /* RTE */':
+                needs_fallthrough = False
+            elif '{ func_table_call(' in last_code and 'return; }' in last_code and not last_code.startswith('if'):
+                needs_fallthrough = False
+            if needs_fallthrough:
                 next_name = next_func['name']
                 lines.append(f'    /* Fall through to next function */')
                 lines.append(f'    {next_name}();')
