@@ -17,11 +17,11 @@ This project takes the original Motorola 68000 machine code from the Genesis ROM
 
 ---
 
-## What Is This Game?
+## Current Status: SEGA Logo Renders, Game Running
 
-Pigskin Footbrawl is a 1992 Sega Genesis port of the 1990 Bally Midway arcade game. It's a medieval-themed football game where two teams of armored warriors battle it out on a field littered with obstacles, weapons, and... well, brawling. It was directed by George Petro and designed by the legendary team at Midway. Jerry Glanville (real NFL coach) lent his name to the Genesis version.
+The SEGA trademark screen renders correctly with the blue sweep effect. The game boots through full hardware init, loads the Z80 sound driver, and enters its TRAP-based cooperative task scheduler. The game loop runs stably for thousands of frames with VDP rendering active.
 
-Think NFL Blitz meets Dungeons & Dragons. On a Sega Genesis. In 1992.
+![SEGA Logo](sega.png)
 
 ---
 
@@ -29,28 +29,22 @@ Think NFL Blitz meets Dungeons & Dragons. On a Sega Genesis. In 1992.
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| ROM Analysis | **Done** | 1,164 functions, 19,291 instructions discovered |
+| ROM Analysis | **Done** | 1,172 functions, 19,291 instructions discovered |
 | Code Generation | **Done** | ~60K lines of recompiled C across 24 source files |
-| Function Registration | **Done** | All 1,164 functions registered in dispatch table |
+| Function Registration | **Done** | All 1,172 functions registered in dispatch table |
 | Cross-func Resolution | **Done** | Iterative splitting until all call targets are registered |
-| Entry Point | **Done** | Genesis init -> main game loop wired up |
-| VBlank Handler | **Done** | IRQ6 handler ($0E9220) connected + VBlank callback |
-| Jump Table Discovery | **Done** | 61 jump tables, 209 targets found |
-| Prologue Scanning | **Done** | LINK/MOVEM patterns in unvisited ROM |
-| Build System | **Done** | CMake + MSVC, links against genrecomp |
-| MOVEM Support | **Done** | Full register list parsing, push/pop/load/store |
-| BTST Memory Fix | **Done** | Memory BTST always byte-sized (Capstone says .l, wrong) |
-| Memory-dest Ops | **Done** | ADD/SUB/AND/OR/BCLR/etc. to memory addresses |
-| MSVC Compat | **Done** | No GCC extensions, builds clean on MSVC 2022 |
-| Cross-func Branches | **Done** | Auto-detected and converted to func_table_call |
-| VDP Cycle Sim | **Done** | v_counter advances during bus accesses |
-| DMA Busy Flag | **Done** | Auto-cleared so DMA wait loops don't spin forever |
-| Z80 Bus Grant | **Done** | Pre-granted, I/O stubs prevent fm_reset crashes |
-| TRAP Dispatch | **Done** | TRAP instructions call their vector handlers |
-| Hardware Init | **Done** | Boots through VDP/Z80/DMA init to task scheduler |
+| Entry Point | **Done** | Genesis init -> main game entry wired up |
+| VBlank Handler | **Done** | IRQ6 handler + VBlank callback drives frame loop |
+| TRAP Dispatch | **Done** | All 8 TRAP handlers (0-7) registered and dispatched |
+| VDP Rendering | **Done** | SEGA logo renders, VDP output displayed via SDL2 |
+| Input System | **Working** | Keyboard mapped (ENTER=START, arrows, Z/X/C=A/B/C) |
+| Task Scheduler | **Running** | TRAP-based cooperative scheduling functional |
+| Hardware Init | **Done** | VDP, Z80, DMA, palette, sprites all initialized |
+| Sound Driver | **Loaded** | Z80 program copied to Z80 RAM (audio not yet playing) |
 | Compilation | **Done** | Compiles + links to native .exe, zero errors |
-| Task Scheduler | **In Progress** | Game uses RAM function pointers for task dispatch |
-| Full Gameplay | **Not Yet** | Need indirect call resolution for task system |
+| Attract Mode | **In Progress** | Game enters attract loop, needs debugging |
+| Title Screen | **Not Yet** | Need to debug game state transitions |
+| Full Gameplay | **Not Yet** | Need title screen first |
 
 ### Code Coverage
 
@@ -58,18 +52,14 @@ Think NFL Blitz meets Dungeons & Dragons. On a Sega Genesis. In 1992.
 ROM Size:        1,048,576 bytes (1024 KB)
 Code Discovered:    ~80 KB (7.6% of ROM)
 Data (gfx/snd):   ~946 KB (92.4% of ROM)
-Functions:            1,164 (346 from analysis + 818 from cross-func splitting)
+Functions:            1,172 (from analysis + cross-func splitting)
 Instructions:        19,291
-Call Edges:             176
 Jump Tables:             61
-Explicit Seeds:          10
-Prologue Patterns:        9
+Explicit Seeds:          17 (TRAP handlers, unreachable functions)
 Native Binary:        ~3 MB (.exe)
 Compile Errors:          0
 Link Errors:             0
 ```
-
-The ROM is mostly data -- graphics tiles, sprite data, sound samples, level layouts. The actual game logic is compact, which tracks for a 1992 Genesis sports game.
 
 ---
 
@@ -93,9 +83,10 @@ The ROM is mostly data -- graphics tiles, sprite data, sound samples, level layo
       |                    Iterative cross-function resolution
       |                    BTST memory fix (always byte-sized)
       |                    TRAP -> func_table_call dispatch
+      |                    Fall-through function chaining
       v
- src/recomp/*.c        -- Native C code (24 files, 1,164 functions)
- src/main.c            -- Game lifecycle (init -> frame loop -> shutdown)
+ src/recomp/*.c        -- Native C code (24 files, 1,172 functions)
+ src/main.c            -- VBlank-driven frame loop
       |
       v
  [CMake + compiler]    -- Links against genrecomp + Genesis Plus GX
@@ -130,15 +121,30 @@ Every M68K instruction becomes a C statement. Registers live in `g_m68k`. Memory
 
 ---
 
-## Runtime Fixes
+## Runtime Architecture
 
-The recompiled code runs natively, but several Genesis hardware behaviors need simulation:
+The game uses a **TRAP-based cooperative task scheduler** -- it never returns from `entry_point()`. The frame loop is driven by VBlank callbacks:
 
-- **VDP Cycle Simulation** -- The VDP V/H counter advances during bus accesses so scanline-polling loops terminate naturally
-- **DMA Busy Auto-Clear** -- VDP DMA completes "instantly" in recompiled code since there's no cycle-accurate interleaving
-- **Z80 Bus Pre-Grant** -- The Z80 bus is pre-granted and BUSREQ/RESET writes are stubbed to prevent fm_reset crashes
-- **VBlank Callback** -- VBlank handler fires automatically when the simulated scanline counter crosses line 224
-- **TRAP Dispatch** -- TRAP instructions push SR/PC on the emulated stack and dispatch to the vector handler via func_table_call
+```
+entry_point()
+  -> main_game_entry()
+    -> game main loop (TRAP #0 = wait VBlank, TRAP #4 = sound, TRAP #7 = DMA)
+      -> task scheduler dispatches per-frame handlers
+        -> VBlank callback fires from bus cycle simulation
+          -> SDL event pump + input update
+          -> VDP rendering (render_line per scanline)
+          -> SDL frame present
+```
+
+### Key Runtime Fixes
+
+- **VDP Cycle Simulation** -- v_counter advances during bus accesses for scanline-polling loops
+- **DMA Busy Auto-Clear** -- VDP DMA completes instantly (no cycle-accurate interleaving)
+- **Z80 Bus Pre-Grant** -- Z80 bus always available, BUSREQ/RESET writes stubbed
+- **VBlank Callback** -- Fires when simulated scanline crosses line 224
+- **TRAP Dispatch** -- All 8 TRAP vectors dispatch to handlers via func_table_call
+- **Fall-Through Chaining** -- Functions without RTS call their successor function
+- **Recursive Loop Conversion** -- BSR-based loops converted to goto loops to prevent stack overflow
 
 ---
 
@@ -163,15 +169,17 @@ gen/
 
 ```bash
 cd pigskin
-cmake -B build
-cmake --build build
+cmake -B build -G "Visual Studio 17 2022" -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DSDL2_DIR="C:/vcpkg/installed/x64-windows/share/sdl2"
+cmake --build build --config Release
 ```
 
 ### Run
 
 ```bash
-./build/pigskin "Jerry Glanville's Pigskin Footbrawl (USA).gen"
+./build/Release/pigskin "Jerry Glanville's Pigskin Footbrawl (USA).gen"
 ```
+
+Controls: Arrow keys = D-pad, Z/X/C = A/B/C, ENTER = START, ESC = quit.
 
 You'll need the original ROM file. This project does not include it.
 
@@ -181,84 +189,40 @@ You'll need the original ROM file. This project does not include it.
 
 ### `tools/analyze_rom.py`
 
-Disassembles the ROM and discovers functions:
-
 ```bash
 python tools/analyze_rom.py rom.gen --stats --output functions.json
 ```
 
-Options:
-- `--stats` -- Print function size rankings and coverage stats
-- `--disasm` -- Full disassembly dump
-- `--disasm-func 0E8FE0` -- Disassemble a specific function
-
-Features:
-- Recursive-descent from vectors + jump table targets
-- Explicit seed addresses for functions unreachable by static analysis
-- Prologue scanning (LINK A5/A6, MOVEM.L patterns) in unvisited ROM
-- Address-load pattern detection (LEA, PEA, MOVE.L #imm)
+Features: recursive-descent disassembly, jump table scanning, prologue detection (LINK/MOVEM), explicit seed addresses, address-load pattern detection.
 
 ### `tools/generate_recomp.py`
-
-Generates recompiled C from the ROM:
 
 ```bash
 python tools/generate_recomp.py rom.gen --output-dir src/recomp/
 ```
 
-Features:
-- Iterative cross-function target resolution (splits functions until stable)
-- BTST memory operand fix (always byte-sized regardless of Capstone suffix)
-- All M68K addressing modes including post-increment, pre-decrement, indexed
-- TRAP instruction dispatch to vector handlers
-
----
-
-## Architecture
-
-Built on the [genrecomp](https://github.com/sp00nznet/genrecomp) toolkit, which provides:
-
-- **M68K CPU Context** -- D0-D7, A0-A7, all flags, all 16 condition codes, complete arithmetic/shift/rotate macros
-- **Memory Bus** -- 24-bit big-endian with cycle simulation, routed through Genesis Plus GX
-- **VDP** -- Real Video Display Processor rendering (320x224) with HV counter simulation
-- **YM2612** -- Real FM synthesis audio (via ymfm)
-- **PSG** -- SN76489 programmable sound generator
-- **Z80** -- Sound driver coprocessor (RAM mapped for M68K access)
-- **I/O** -- Controller input (3-button and 6-button pads)
-- **SDL2 Platform** -- Window, audio output, keyboard/gamepad input
+Features: iterative cross-function resolution, BTST byte-size fix, TRAP vector dispatch, fall-through chaining, computed JSR handling.
 
 ---
 
 ## What's Next
 
-- [x] ~~Implement MOVEM~~ -- Full register list parsing
-- [x] ~~Memory-destination operations~~ -- ADD/SUB/AND/OR/BCLR/etc. to memory
-- [x] ~~MSVC compatibility~~ -- Builds clean on Visual Studio 2022
-- [x] ~~Cross-function branch detection~~ -- Auto-converted to func_table_call
-- [x] ~~Compile + link~~ -- Native executable, zero errors
-- [x] ~~Recompile stub functions~~ -- All 4 stubs replaced with real code
-- [x] ~~BTST memory fix~~ -- Byte-sized reads for memory BTST (Capstone bug)
-- [x] ~~VDP cycle simulation~~ -- Scanline counter advances during execution
-- [x] ~~DMA busy flag~~ -- Auto-cleared on bus access
-- [x] ~~Z80 bus management~~ -- Pre-granted, safe I/O stubs
-- [x] ~~TRAP dispatch~~ -- Handlers called via func_table_call
-- [x] ~~Iterative function splitting~~ -- 346 -> 1,164 functions
-- [x] ~~Hardware init boot~~ -- Past VDP/Z80/DMA init to task scheduler
-- [ ] Resolve RAM-stored function pointers (task scheduler indirect calls)
-- [ ] Implement task fiber/coroutine system for TRAP-based scheduling
-- [ ] Test with a Genesis emulator side-by-side for comparison debugging
-- [ ] Map RAM addresses to meaningful variable names
-- [ ] Get to title screen
+- [x] SEGA logo rendering with blue sweep effect
+- [x] TRAP-based task scheduler running
+- [x] Input system connected (keyboard -> GPGX I/O)
+- [x] Stable 1000+ frame operation
+- [ ] Debug attract mode display (compare with emulator)
+- [ ] Fix "push return + JMP" computed call pattern systematically
+- [ ] Get title screen visible
 - [ ] Get to gameplay
+- [ ] Audio output (Z80 sound driver integration)
 - [ ] Full playable recompilation
 
 ---
 
 ## Related Projects
 
-This is part of the [sp00nznet](https://github.com/sp00nznet) recompilation ecosystem:
-
-- [genrecomp](https://github.com/sp00nznet/genrecomp) -- Genesis/Mega Drive recomp toolkit (what powers this project)
+- [genrecomp](https://github.com/sp00nznet/genrecomp) -- Genesis/Mega Drive recomp toolkit
 - [recompclass](https://github.com/sp00nznet/recompclass) -- Learn static recompilation from scratch
 
 ---

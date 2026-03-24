@@ -11,6 +11,7 @@
 
 #include <genrecomp/genrecomp.h>
 #include <genrecomp/bus.h>
+#include <genrecomp/input.h>
 #include "recomp/recomp_funcs.h"
 #include <stdio.h>
 
@@ -25,20 +26,20 @@ static int s_frame_count = 0;
  * and set a flag for frame rendering. Frame rendering happens in a
  * separate hook. */
 static void pigskin_vblank(void) {
-    /* Run the game's VBlank handler (increments frame counters) */
-    vec_irq6_vblank();
-
-    /* Poll SDL events (must happen periodically to keep window responsive) */
+    /* Poll SDL events and update input BEFORE the game's VBlank handler,
+     * so the game sees fresh input state when it reads I/O ports. */
     if (!genrecomp_begin_frame()) {
         printf("\nWindow closed, exiting.\n");
         genrecomp_shutdown();
         exit(0);
     }
 
-    /* Render VDP output and present frame.
-     * Skip first few frames to let VDP state stabilize. */
+    /* Run the game's VBlank handler AFTER input update */
+    vec_irq6_vblank();
+
     /* Render VDP output and present frame */
     genrecomp_end_frame();
+
 
     s_frame_count++;
     if (s_frame_count <= 10 || (s_frame_count % 60 == 0)) {
