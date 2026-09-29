@@ -64,7 +64,7 @@ only needed for `--record`.
    ```
    py -3 tools\generate_recomp.py "path\to\Pigskin.gen" -o src\recomp
    ```
-   Expected last lines: `Generated 23 source files with 1172 functions` and `Done!`.
+   Expected last lines: `Generated 22 source files with 1085 functions` and `Done!`.
 3. Configure and build:
    ```
    cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
