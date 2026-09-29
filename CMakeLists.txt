@@ -6,11 +6,11 @@ set(GENRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../genrecomp" CACHE PATH "genreco
 add_subdirectory(${GENRECOMP_DIR} genrecomp_build)
 
 # src/recomp is generated from your own ROM and never committed (README,
-# Getting Started): python tools/generate_recomp.py <rom> -o src/recomp
+# Getting Started): genrecomp's tools/recompiler/generate.py with recomp.json
 file(GLOB RECOMP_SOURCES src/recomp/*.c)
 if(NOT RECOMP_SOURCES)
     message(FATAL_ERROR "src/recomp/ is empty. Generate it from your ROM first:\n"
-        "  python tools/generate_recomp.py \"path/to/rom.gen\" -o src/recomp\n"
+        "  python ../genrecomp/tools/recompiler/generate.py \"path/to/rom.gen\" -o src/recomp -c recomp.json\n"
         "or run Setup.cmd, which does every step.")
 endif()
 

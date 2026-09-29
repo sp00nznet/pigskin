@@ -40,7 +40,7 @@ static void pigskin_vblank(void) {
     }
 
     /* Run the game's VBlank handler AFTER input update */
-    func_table_call(0x0E9220); /* vec_irq6_vblank, via the dispatcher so its tail jumps run */
+    genrecomp_vblank_irq(); /* the game's level-6 handler, context saved */
 
     /* Render VDP output and present frame */
     genrecomp_end_frame();

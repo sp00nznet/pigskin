@@ -18,7 +18,8 @@ scripted 9,000-frame headless run (2.5 minutes of play) finishes in about 17
 seconds with no aborts.
 
 Not verified yet: audio (the sound driver runs and is mixed, but nobody has
-listened), a match played to the final whistle, and two-player. Known issues are
+listened), a match played to the final whistle, and two-player. It is built
+by genrecomp's shared recompiler, which also runs General Chaos. Known issues are
 in [docs/debugging.md](docs/debugging.md#known-issues).
 
 ## Screenshots
@@ -59,12 +60,12 @@ only needed for `--record`.
      genrecomp\   git clone --recursive https://github.com/sp00nznet/genrecomp.git
      pigskin\     this repo
    ```
-   Until genrecomp#1-#5 are merged, check out its `chore/house-style` branch.
+   Until genrecomp#6 and #7 are merged, check out its `feat/shared-recompiler` branch.
 2. Generate the C source from your ROM (about 10 s):
    ```
-   py -3 tools\generate_recomp.py "path\to\Pigskin.gen" -o src\recomp
+   py -3 ..\genrecomp\tools\recompiler\generate.py "path\to\Pigskin.gen" -o src\recomp -c recomp.json
    ```
-   Expected last lines: `Generated 22 source files with 1085 functions` and `Done!`.
+   Expected last lines: `Generated 27 source files with 1341 functions` and `Done!`.
 3. Configure and build:
    ```
    cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
@@ -102,7 +103,8 @@ game's main thread is every second.
 
 ## How it works
 
-`tools/generate_recomp.py` disassembles the ROM from its entry points and emits
+genrecomp's shared recompiler (`tools/recompiler/`), configured by this repo's
+`recomp.json`, disassembles the ROM from its entry points and emits
 one C function per 68K entry point. Every instruction becomes a C statement on
 genrecomp's register file and bus. For example, this made-up routine:
 
@@ -128,9 +130,9 @@ return;
 
 The game never returns from its entry point: it waits for frames inside a TRAP.
 So `src/main.c` registers a VBlank callback with genrecomp's scanline clock,
-which runs the game's VBlank handler and presents each frame. The generator's
-design (fall-through regions, tail jumps, computed calls) and the debugging
-workflow are in [docs/debugging.md](docs/debugging.md).
+which raises the game's VBlank interrupt and presents each frame. The
+recompiler's design is in genrecomp's `docs/recompiler.md`; how this title was
+debugged is in [docs/debugging.md](docs/debugging.md).
 
 ## Building from source
 

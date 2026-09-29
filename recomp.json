@@ -1,0 +1,16 @@
+{
+  "title": "Pigskin Footbrawl",
+  "code_ranges": [["0x0E0000", "0x100000"]],
+  "seeds": {
+    "0x0E8FE0": "main_game_entry",
+    "0x0EAD36": "sub_0EAD36",
+    "0x0FB294": "sub_0FB294",
+    "0x0FB1C2": "sub_0FB1C2",
+    "0x0F8452": "sub_0F8452",
+    "0x0F970C": "sub_0F970C",
+    "0x0F9C9C": "sub_0F9C9C",
+    "0x0F9E2E": "sub_0F9E2E",
+    "0x0FA2D4": "sub_0FA2D4",
+    "0x0FA14A": "sub_0FA14A"
+  }
+}

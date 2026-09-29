@@ -51,7 +51,7 @@ pigskin.exe --headless --frames 6000 --record game.mp4 ^
   --press 3200:START:10 rom.gen
 ```
 
-## Generator fixes (`tools/generate_recomp.py`)
+## Generator fixes (now genrecomp `tools/recompiler/`)
 
 **Fall-through regions.** The analyzer splits code at every address something
 branches to from outside, so a loop whose head is such an address spans two C
@@ -69,14 +69,16 @@ next region, is `{ func_table_tail(x); return; }`. The play loop jumps between
 seconds into a game.
 
 **Computed calls.** `move.l #ret,-(a7); jmp (a5)` calls through a register and
-returns to `ret`. RTS is a C return and JSR pushes nothing here, so the pair is
-emitted as `func_table_call(a5); func_table_tail(ret)`.
+returns to `ret`. This was first a special case in the generator; genrecomp
+now handles it generally: JSR pushes the real return address and RTS follows
+whatever the 68K stack holds (genrecomp `docs/recomp-runtime.md`).
 
 ## Known issues
 
-- Unmapped reads at `$BC8Fxx` a few times a game (logged as "cycle counter
-  went backwards"). A recompiled pointer is wrong somewhere; the game carries
-  on, but real hardware would hang.
+- The task switcher returns into another task's saved PC, which isn't an
+  entry point; genrecomp logs `RTS to $0EF4AC (expected ...) has no
+  function; returning` and falls back to a plain return, which is correct
+  here.
 - The title screen's bottom rows are cut off; probably an H-interrupt split,
   which the recomp doesn't raise.
 - Audio is mixed but not recorded by `--record`, and has not been heard in a

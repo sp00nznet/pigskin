@@ -16,7 +16,7 @@ $Log = Join-Path $Root "setup.log"
 $Build = Join-Path $Root "build"
 $Genrecomp = Join-Path (Split-Path -Parent $Root) "genrecomp"
 $GenrecompUrl = "https://github.com/sp00nznet/genrecomp.git"
-$GenrecompPin = "656dfc9"   # genrecomp#1-#5; move to master once merged
+$GenrecompPin = "45e5832"   # genrecomp#7 (shared recompiler); move to master once merged
 "pigskin setup $(Get-Date -Format s)" | Out-File $Log -Encoding utf8
 
 function Say($msg) { Write-Host $msg; $msg | Out-File $Log -Append -Encoding utf8 }
@@ -119,7 +119,7 @@ Say "    using $Rom"
 # 4. Generate source from the ROM ------------------------------------------
 Say "4/6 Generating C from your ROM (about 10 seconds)"
 if (-not (Test-Path "$Root\src\recomp\recomp_funcs.h")) {
-    Run "Generating source" $Py "$PyArgs `"$Root\tools\generate_recomp.py`" `"$Rom`" -o `"$Root\src\recomp`""
+    Run "Generating source" $Py "$PyArgs `"$Genrecomp\tools\recompiler\generate.py`" `"$Rom`" -o `"$Root\src\recomp`" -c `"$Root\recomp.json`""
 }
 Say "    src\recomp ready"
 
