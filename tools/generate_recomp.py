@@ -7,6 +7,10 @@ files that use the genrecomp API (g_m68k, bus_read/write, M68K_* macros).
 
 Usage:
     python tools/generate_recomp.py <rom_path> --output-dir src/recomp/
+
+The output is derived from the ROM, so it is gitignored and never committed:
+each user generates it from their own ROM. Design notes (fall-through
+regions, tail jumps, computed calls): docs/debugging.md.
 """
 
 import struct
@@ -55,10 +59,9 @@ class M68KTranslator:
         lines = []
 
         # Add label if this address is a branch target
-        if addr in self.labels and addr != func_start:
-            label = self.labels[addr]
-            if label.startswith('loc_'):
-                lines.append(f"{label}:")
+        # (unreferenced ones are dropped after the function is assembled)
+        if addr in self.labels:
+            lines.append(f"{self.labels[addr]}:")
 
         # Parse size suffix
         size = 16  # default word
@@ -999,7 +1002,7 @@ class M68KTranslator:
             label = self.labels.get(target, f'sub_{target:06X}')
             if label.startswith('loc_'):
                 return f'goto {label};'
-            return f'{{ {label}(); return; }}'
+            return f'{{ func_table_call(0x{target:06X}); return; }} /* {label} */'
         # True indirect JMP through register/EA
         ea_addr = self._ea_addr(ops[0])
         if 'UNHANDLED' not in ea_addr:
@@ -1201,24 +1204,67 @@ class CodeGenerator:
             for i in range(len(all_functions) - 1):
                 next_func_map[all_functions[i]['start']] = all_functions[i + 1]
 
+        regions = self._fallthrough_regions(all_functions or funcs)
+
         for func in funcs:
-            next_func = next_func_map.get(func['start'])
-            lines.extend(self._generate_function(func, next_func))
+            region = regions[func['start']]
+            next_func = next_func_map.get(region[-1]['start'])
+            lines.extend(self._generate_function(func, next_func, region))
             lines.append('')
 
         path = os.path.join(self.output_dir, f'{chunk_name}.c')
         with open(path, 'w') as f:
             f.write('\n'.join(lines))
 
-    def _generate_function(self, func, next_func=None):
-        """Generate C code for one function."""
+    @staticmethod
+    def _fallthrough_regions(functions):
+        """Group functions that run into each other into regions.
+
+        The analyzer splits code at every externally-referenced address, so a
+        loop whose head is such an address ends up spanning two C functions,
+        and its back-edge becomes a recursive call that grows the C stack
+        every iteration (see docs/debugging.md). Every function in a region
+        is emitted with the whole region's code and enters it with a goto,
+        so all branches inside the region stay gotos.
+        """
+        regions, cur = {}, []
+        for f in functions:
+            if cur:
+                prev = cur[-1]
+                last = prev['insn_addrs'][-1] if prev['insn_addrs'] else None
+                mnem = CodeGenerator._mnem_of(prev, last)
+                runs_on = (prev['end'] == f['start'] and not prev['has_return']
+                           and not mnem.startswith(('bra', 'jmp')))
+                if not runs_on:
+                    for g in cur:
+                        regions[g['start']] = cur
+                    cur = []
+            cur.append(f)
+        for g in cur:
+            regions[g['start']] = cur
+        return regions
+
+    _instructions = None
+
+    @staticmethod
+    def _mnem_of(func, addr):
+        insns = CodeGenerator._instructions
+        return insns[addr][0] if insns and addr in insns else ''
+
+    def _generate_function(self, func, next_func=None, region=None):
+        """Generate C code for one function (entered at func['start'])."""
+        CodeGenerator._instructions = self.analyzer.instructions
+        region = region or [func]
         lines = []
         name = func['name']
         start = func['start']
         end = func['end']
-        insn_addrs = func.get('insn_addrs', [])
+        reg_start, reg_end = region[0]['start'], region[-1]['end']
+        insn_addrs = [a for g in region for a in g.get('insn_addrs', [])]
 
         lines.append(f'/* ${start:06X}-${end:06X}  ({func["insn_count"]} instructions, {func["size"]} bytes) */')
+        if len(region) > 1:
+            lines.append(f'/* region ${reg_start:06X}-${reg_end:06X}, entered at ${start:06X} */')
         lines.append(f'void {name}(void) {{')
 
         if not insn_addrs:
@@ -1226,16 +1272,23 @@ class CodeGenerator:
             lines.append(f'}}')
             return lines
 
+        # Every function start is a potential goto target within the region
+        for g in region:
+            self.analyzer.labels.setdefault(g['start'], g['name'])
+        if start != reg_start:
+            lines.append(f'    goto {self.analyzer.labels[start]};')
+
         for addr in insn_addrs:
             if addr not in self.analyzer.instructions:
                 continue
             mnemonic, op_str, size, raw = self.analyzer.instructions[addr]
-            c_lines = self.translator.translate_instruction(addr, mnemonic, op_str, raw, start, end)
+            c_lines = self.translator.translate_instruction(addr, mnemonic, op_str, raw, reg_start, reg_end)
             lines.extend(c_lines)
 
         # If function didn't end with RTS/RTE/JMP/BRA, it falls through to the
         # next function. Generate a call to the next function so execution continues.
         # Skip if the last emitted line already returns (e.g. func_table_call + return).
+        func = region[-1]
         if not func['has_return'] and next_func:
             # Check if the last line is an unconditional return/jump.
             # Conditional returns (inside if) still need fall-through.
@@ -1248,7 +1301,7 @@ class CodeGenerator:
             if needs_fallthrough:
                 next_name = next_func['name']
                 lines.append(f'    /* Fall through to next function */')
-                lines.append(f'    {next_name}();')
+                lines.append(f'    func_table_tail(0x{next_func["start"]:06X}); /* {next_name} */')
 
         lines.append(f'}}')
 
@@ -1274,10 +1327,38 @@ class CodeGenerator:
                 )
             fixed_lines.append(line)
 
+        # "Push return address, JMP (An)" is a computed call: the callee's RTS
+        # lands on the pushed address. RTS is a C return here and JSR pushes
+        # nothing, so call the target, then continue at the return address.
+        push_re = re.compile(r'\(uint32_t\)\((0x[0-9A-Fa-f]+)\); g_m68k\.a\[7\] -= 4; bus_write32\(g_m68k\.a\[7\], _mv\)')
+        jmp_re = re.compile(r'^\s*\{ func_table_call\((.+)\); return; \} /\* JMP indirect')
+        i = 0
+        while i + 1 < len(fixed_lines):
+            p, j = push_re.search(fixed_lines[i]), jmp_re.match(fixed_lines[i + 1])
+            if p and j:
+                ret = int(p.group(1), 16)
+                fixed_lines[i:i + 2] = [
+                    f'    /* computed call: push ${ret:06X}; JMP {j.group(1)} */',
+                    f'    func_table_call({j.group(1)});',
+                    f'    {{ func_table_call(0x{ret:06X}); return; }}']
+            i += 1
+
+        # Jumps out of the function are tail calls: hand them to the
+        # dispatcher's trampoline so M68K loops through JMP/BRA chains don't
+        # grow the C stack (genrecomp func_table_tail).
+        fixed_lines = [re.sub(r'func_table_call\(([^;]*)\); return;', r'func_table_tail(\1); return;', l)
+                       for l in fixed_lines]
+
+        # Drop labels nothing jumps to (every instruction address with a
+        # label gets one, which would otherwise trip unused-label warnings)
+        used = set(re.findall(r'goto (\w+);', '\n'.join(fixed_lines)))
+        fixed_lines = [l for l in fixed_lines
+                       if not (re.fullmatch(r'\w+:', l.strip()) and l.strip()[:-1] not in used)]
+
         # Also track all func_table_call targets already in the code
         # (from translator's _gen_bsr, _gen_bcc, etc.)
         for line in fixed_lines:
-            for m in re.finditer(r'func_table_call\(0x([0-9A-Fa-f]+)\)', line):
+            for m in re.finditer(r'func_table_(?:call|tail)\(0x([0-9A-Fa-f]+)\)', line):
                 self.cross_func_targets.add(int(m.group(1), 16))
 
         return fixed_lines

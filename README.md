@@ -1,232 +1,150 @@
-# PIGSKIN FOOTBRAWL: RECOMPILED
+# Pigskin Footbrawl: Recompiled
+
+A static recompilation of *Jerry Glanville's Pigskin Footbrawl* (Sega Genesis,
+1992). The game's 68000 code is translated ahead of time into C and compiled
+into a native Windows program. The Genesis video, sound and I/O chips come from
+[genrecomp](https://github.com/sp00nznet/genrecomp), which wraps Genesis Plus GX.
+
+You supply your own ROM. Everything generated from it stays on your machine:
+this repo contains the tools and the hand-written glue, never the ROM, its
+disassembly, or the C generated from it.
+
+## Status
+
+**Alpha.** It boots through the SEGA and RazorSoft logos, the title and
+credits, and the options and skill-level menus, then plays a full one-player
+game: kickoff, tackles, passes, touchdowns, the period clock running down. A
+scripted 9,000-frame headless run (2.5 minutes of play) finishes in about 17
+seconds with no aborts.
+
+Not verified yet: audio (the sound driver runs and is mixed, but nobody has
+listened), a match played to the final whistle, and two-player. Known issues are
+in [docs/debugging.md](docs/debugging.md#known-issues).
+
+## Screenshots
+
+Recorded headless from the recompiled build:
+
+![In game](docs/screenshots/ingame.png)
+![Title](docs/screenshots/title.png)
+
+## Getting Started
+
+You need your own *Jerry Glanville's Pigskin Footbrawl (USA)* ROM: 1 MB,
+unzipped (`.gen` or `.bin`). Windows 10/11 only for now.
+
+### Quick start
+
+1. Download this repo (Code → Download ZIP) and unzip it, or clone it.
+2. Put your ROM in the same folder (or have its path ready).
+3. Double-click **`Setup.cmd`**. It checks for Git, CMake, Visual Studio 2022
+   (C++ workload), Python 3 with `capstone`, SDL2 (via vcpkg) and genrecomp,
+   and **asks before installing** anything missing, saying what and how big.
+   It then checks your ROM, generates the C source from it, builds, and runs a
+   600-frame headless smoke test. If a step fails, it stops with one sentence on
+   what to do and keeps the details in `setup.log`. Rerunning skips finished
+   steps.
+4. Double-click **`Play Pigskin.cmd`**, which Setup leaves in the folder.
+
+### Step by step
+
+Prerequisites: Git, CMake 3.16+, Visual Studio 2022 with "Desktop development
+with C++", Python 3.10+ with `capstone` (`py -3 -m pip install capstone`), SDL2
+via vcpkg (`C:\vcpkg\vcpkg.exe install sdl2:x64-windows`). `ffmpeg` on PATH is
+only needed for `--record`.
+
+1. Put genrecomp beside this folder:
+   ```
+   gen\
+     genrecomp\   git clone --recursive https://github.com/sp00nznet/genrecomp.git
+     pigskin\     this repo
+   ```
+   Until genrecomp#1-#5 are merged, check out its `chore/house-style` branch.
+2. Generate the C source from your ROM (about 10 s):
+   ```
+   py -3 tools\generate_recomp.py "path\to\Pigskin.gen" -o src\recomp
+   ```
+   Expected last lines: `Generated 23 source files with 1172 functions` and `Done!`.
+3. Configure and build:
+   ```
+   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+   cmake --build build --config Release
+   ```
+   Expected last line: `pigskin.vcxproj -> ...\build\Release\pigskin.exe`.
+4. Run it:
+   ```
+   build\Release\pigskin.exe "path\to\Pigskin.gen"
+   ```
+
+Usual trip-ups:
+- `python` opens the Microsoft Store: that's the Store alias, not Python.
+  Use `py -3`, or turn the alias off in Settings → Apps → App execution aliases.
+- `ModuleNotFoundError: No module named 'capstone'`: `py -3 -m pip install capstone`.
+- `src/recomp/ is empty` from CMake: step 2 hasn't run.
+- A new terminal is needed after installing a tool, so PATH picks it up.
+
+## Usage
+
+Controls: arrow keys = D-pad, Z/X/C = A/B/C, Enter = Start, Esc = quit.
+
+Headless (no window; works over RDP), recorded to video, with scripted presses
+that start a one-player game:
 
 ```
-  ____  ___ ____ ____  _  _____ _   _
- |  _ \|_ _/ ___/ ___|| |/ /_ _| \ | |
- | |_) || | |  _\___ \| ' / | ||  \| |
- |  __/ | | |_| |___) | . \ | || |\  |
- |_|   |___\____|____/|_|\_\___|_| \_|
-          F O O T B R A W L
+build\Release\pigskin.exe --headless --frames 6000 --record game.mp4 ^
+  --press 2300:START:10 --press 2600:START:10 --press 2900:START:10 --press 3200:START:10 ^
+  "path\to\Pigskin.gen"
 ```
 
-**A static recompilation of Jerry Glanville's Pigskin Footbrawl (Sega Genesis, 1992)**
+All flags (`--headless`, `--record`, `--frames`, `--press`, `--ram-dump`) come from
+genrecomp; see its `docs/recomp-runtime.md`. `PIGSKIN_STACK=1` prints where the
+game's main thread is every second.
 
-> *"It's not just football. It's medieval football. With swords."*
+## How it works
 
-This project takes the original Motorola 68000 machine code from the Genesis ROM and translates it ahead-of-time into native C, then compiles it to run natively on modern hardware. No emulator in the loop -- the recompiled code IS the CPU, and real Genesis hardware (VDP, YM2612, PSG, Z80) is provided by [genrecomp](https://github.com/sp00nznet/genrecomp) via Genesis Plus GX.
+`tools/generate_recomp.py` disassembles the ROM from its entry points and emits
+one C function per 68K entry point. Every instruction becomes a C statement on
+genrecomp's register file and bus. For example, this made-up routine:
 
----
-
-## Current Status: SEGA Logo Renders, Game Running
-
-The SEGA trademark screen renders correctly with the blue sweep effect. The game boots through full hardware init, loads the Z80 sound driver, and enters its TRAP-based cooperative task scheduler. The game loop runs stably for thousands of frames with VDP rendering active.
-
-![SEGA Logo](sega.png)
-
----
-
-## Project Status
-
-| Component | Status | Details |
-|-----------|--------|---------|
-| ROM Analysis | **Done** | 1,172 functions, 19,291 instructions discovered |
-| Code Generation | **Done** | ~60K lines of recompiled C across 24 source files |
-| Function Registration | **Done** | All 1,172 functions registered in dispatch table |
-| Cross-func Resolution | **Done** | Iterative splitting until all call targets are registered |
-| Entry Point | **Done** | Genesis init -> main game entry wired up |
-| VBlank Handler | **Done** | IRQ6 handler + VBlank callback drives frame loop |
-| TRAP Dispatch | **Done** | All 8 TRAP handlers (0-7) registered and dispatched |
-| VDP Rendering | **Done** | SEGA logo renders, VDP output displayed via SDL2 |
-| Input System | **Working** | Keyboard mapped (ENTER=START, arrows, Z/X/C=A/B/C) |
-| Task Scheduler | **Running** | TRAP-based cooperative scheduling functional |
-| Hardware Init | **Done** | VDP, Z80, DMA, palette, sprites all initialized |
-| Sound Driver | **Loaded** | Z80 program copied to Z80 RAM (audio not yet playing) |
-| Compilation | **Done** | Compiles + links to native .exe, zero errors |
-| Attract Mode | **In Progress** | Game enters attract loop, needs debugging |
-| Title Screen | **Not Yet** | Need to debug game state transitions |
-| Full Gameplay | **Not Yet** | Need title screen first |
-
-### Code Coverage
-
-```
-ROM Size:        1,048,576 bytes (1024 KB)
-Code Discovered:    ~80 KB (7.6% of ROM)
-Data (gfx/snd):   ~946 KB (92.4% of ROM)
-Functions:            1,172 (from analysis + cross-func splitting)
-Instructions:        19,291
-Jump Tables:             61
-Explicit Seeds:          17 (TRAP handlers, unreachable functions)
-Native Binary:        ~3 MB (.exe)
-Compile Errors:          0
-Link Errors:             0
-```
-
----
-
-## How It Works
-
-### The Pipeline
-
-```
- .gen ROM file
-      |
-      v
- [analyze_rom.py]     -- Recursive-descent M68K disassembly
-      |                   Function boundary detection
-      |                   Jump table + prologue scanning
-      |                   Explicit seed addresses
-      v
- functions.json        -- Machine-readable function map
-      |
-      v
- [generate_recomp.py]  -- M68K -> C translation
-      |                    Iterative cross-function resolution
-      |                    BTST memory fix (always byte-sized)
-      |                    TRAP -> func_table_call dispatch
-      |                    Fall-through function chaining
-      v
- src/recomp/*.c        -- Native C code (24 files, 1,172 functions)
- src/main.c            -- VBlank-driven frame loop
-      |
-      v
- [CMake + compiler]    -- Links against genrecomp + Genesis Plus GX
-      |
-      v
- pigskin.exe           -- Native executable, real Genesis hardware
-```
-
-### What the Recompiled Code Looks Like
-
-Original M68K:
 ```asm
-  0ECA24:  CLR.W   ($FF8E76).l
-  0ECA2A:  CLR.W   ($FFB53A).l
-  0ECA30:  MOVE.B  #$03, ($FFB9A8).l
-  0ECA36:  LEA     $080000, A0
-  0ECA3C:  MOVE.W  #$0040, D1
+    move.w  d0, $FF1000
+    addq.w  #1, d0
+    beq.s   .zero
+    jsr     update_score
+.zero:
+    rts
 ```
 
-Recompiled C:
+becomes
+
 ```c
-    bus_write16(0xFF8E76, 0);
-    g_m68k.flag_N = false; g_m68k.flag_Z = true;
-    bus_write16(0xFFB53A, 0);
-    g_m68k.flag_N = false; g_m68k.flag_Z = true;
-    bus_write8(0xFFB9A8, 0x3);
-    g_m68k.a[0] = 0x080000;
-    g_m68k.d[1] = (g_m68k.d[1] & 0xFFFF0000u) | ((uint16_t)(0x40));
+bus_write16(0xFF1000, (uint16_t)g_m68k.d[0]);
+M68K_ADD16(g_m68k.d[0], 1);
+if (M68K_CC_EQ) goto loc_zero;
+func_table_call(0x001234); /* update_score */
+loc_zero:
+return;
 ```
 
-Every M68K instruction becomes a C statement. Registers live in `g_m68k`. Memory goes through `bus_read`/`bus_write` which hits real Genesis Plus GX hardware. Branches become `goto`. Calls go through `func_table_call()`.
+The game never returns from its entry point: it waits for frames inside a TRAP.
+So `src/main.c` registers a VBlank callback with genrecomp's scanline clock,
+which runs the game's VBlank handler and presents each frame. The generator's
+design (fall-through regions, tail jumps, computed calls) and the debugging
+workflow are in [docs/debugging.md](docs/debugging.md).
 
----
+## Building from source
 
-## Runtime Architecture
-
-The game uses a **TRAP-based cooperative task scheduler** -- it never returns from `entry_point()`. The frame loop is driven by VBlank callbacks:
-
-```
-entry_point()
-  -> main_game_entry()
-    -> game main loop (TRAP #0 = wait VBlank, TRAP #4 = sound, TRAP #7 = DMA)
-      -> task scheduler dispatches per-frame handlers
-        -> VBlank callback fires from bus cycle simulation
-          -> SDL event pump + input update
-          -> VDP rendering (render_line per scanline)
-          -> SDL frame present
-```
-
-### Key Runtime Fixes
-
-- **VDP Cycle Simulation** -- v_counter advances during bus accesses for scanline-polling loops
-- **DMA Busy Auto-Clear** -- VDP DMA completes instantly (no cycle-accurate interleaving)
-- **Z80 Bus Pre-Grant** -- Z80 bus always available, BUSREQ/RESET writes stubbed
-- **VBlank Callback** -- Fires when simulated scanline crosses line 224
-- **TRAP Dispatch** -- All 8 TRAP vectors dispatch to handlers via func_table_call
-- **Fall-Through Chaining** -- Functions without RTS call their successor function
-- **Recursive Loop Conversion** -- BSR-based loops converted to goto loops to prevent stack overflow
-
----
-
-## Building
-
-### Prerequisites
-
-- CMake 3.16+
-- C compiler (MSVC, Clang, or GCC)
-- SDL2 development libraries
-- [genrecomp](https://github.com/sp00nznet/genrecomp) checked out alongside this project
-
-### Directory Layout
-
-```
-gen/
-  genrecomp/        <-- Genesis recomp toolkit
-  pigskin/          <-- This project (you are here)
-```
-
-### Build
-
-```bash
-cd pigskin
-cmake -B build -G "Visual Studio 17 2022" -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DSDL2_DIR="C:/vcpkg/installed/x64-windows/share/sdl2"
-cmake --build build --config Release
-```
-
-### Run
-
-```bash
-./build/Release/pigskin "Jerry Glanville's Pigskin Footbrawl (USA).gen"
-```
-
-Controls: Arrow keys = D-pad, Z/X/C = A/B/C, ENTER = START, ESC = quit.
-
-You'll need the original ROM file. This project does not include it.
-
----
-
-## Tools
-
-### `tools/analyze_rom.py`
-
-```bash
-python tools/analyze_rom.py rom.gen --stats --output functions.json
-```
-
-Features: recursive-descent disassembly, jump table scanning, prologue detection (LINK/MOVEM), explicit seed addresses, address-load pattern detection.
-
-### `tools/generate_recomp.py`
-
-```bash
-python tools/generate_recomp.py rom.gen --output-dir src/recomp/
-```
-
-Features: iterative cross-function resolution, BTST byte-size fix, TRAP vector dispatch, fall-through chaining, computed JSR handling.
-
----
-
-## What's Next
-
-- [x] SEGA logo rendering with blue sweep effect
-- [x] TRAP-based task scheduler running
-- [x] Input system connected (keyboard -> GPGX I/O)
-- [x] Stable 1000+ frame operation
-- [ ] Debug attract mode display (compare with emulator)
-- [ ] Fix "push return + JMP" computed call pattern systematically
-- [ ] Get title screen visible
-- [ ] Get to gameplay
-- [ ] Audio output (Z80 sound driver integration)
-- [ ] Full playable recompilation
-
----
-
-## Related Projects
-
-- [genrecomp](https://github.com/sp00nznet/genrecomp) -- Genesis/Mega Drive recomp toolkit
-- [recompclass](https://github.com/sp00nznet/recompclass) -- Learn static recompilation from scratch
-
----
+Step by step above is the build. The generated source is regenerated whenever
+you run step 2; delete `src\recomp` to force it from Setup.
 
 ## License
 
-MIT. The recompilation tools and generated code are open source. You'll need your own legally obtained ROM to use this.
+MIT for this repo's code ([LICENSE](LICENSE)). Binaries link Genesis Plus GX
+through genrecomp, and its licence forbids commercial use, so builds are
+non-commercial (see genrecomp's `NOTICE`). The game belongs to its rights
+holders; bring your own legally obtained ROM.
+
+## Related
+
+- [genrecomp](https://github.com/sp00nznet/genrecomp): the Genesis runtime this builds on
+- [genchaos](https://github.com/sp00nznet/genchaos): General Chaos, the next Genesis title

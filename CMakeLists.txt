@@ -1,11 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
 project(pigskin C)
 
-add_subdirectory(../genrecomp genrecomp_build)
+# genrecomp: the Genesis hardware runtime, checked out beside this repo
+set(GENRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../genrecomp" CACHE PATH "genrecomp checkout")
+add_subdirectory(${GENRECOMP_DIR} genrecomp_build)
 
+# src/recomp is generated from your own ROM and never committed (README,
+# Getting Started): python tools/generate_recomp.py <rom> -o src/recomp
 file(GLOB RECOMP_SOURCES src/recomp/*.c)
+if(NOT RECOMP_SOURCES)
+    message(FATAL_ERROR "src/recomp/ is empty. Generate it from your ROM first:\n"
+        "  python tools/generate_recomp.py \"path/to/rom.gen\" -o src/recomp\n"
+        "or run Setup.cmd, which does every step.")
+endif()
 
 add_executable(pigskin src/main.c ${RECOMP_SOURCES})
-
-target_link_libraries(pigskin PRIVATE genrecomp genplusgx_hw)
-target_include_directories(pigskin PRIVATE src/ ../genrecomp/include)
+target_link_libraries(pigskin PRIVATE genrecomp)
+target_include_directories(pigskin PRIVATE src/)

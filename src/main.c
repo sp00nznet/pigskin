@@ -3,17 +3,22 @@
  *
  * Original ROM: PIGSKIN ((C) RSI 1992.SEP)
  *
- * This game uses a TRAP-based cooperative task scheduler. The game's main
- * loop runs INSIDE entry_point() and never returns — it yields via TRAP #0
- * (wait for VBlank) and TRAP #4 (yield to scheduler). The VBlank callback
- * handles frame rendering and SDL event pumping.
+ * The game's main loop runs inside entry_point() and never returns; it
+ * waits for frames in TRAP #0 (spin until the VBlank counter $FF3850
+ * reaches $FFFD18) and sends sound commands with TRAP #4. So the frame is
+ * driven from genrecomp's scanline clock: at VBlank it calls
+ * pigskin_vblank(), which runs the game's VBlank handler and presents.
+ * Debugging workflow: docs/debugging.md.
  */
 
 #include <genrecomp/genrecomp.h>
 #include <genrecomp/bus.h>
 #include <genrecomp/input.h>
+#include <genrecomp/platform.h>
+#include <genrecomp/func_table.h>
 #include "recomp/recomp_funcs.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 static int s_frame_count = 0;
 
@@ -35,7 +40,7 @@ static void pigskin_vblank(void) {
     }
 
     /* Run the game's VBlank handler AFTER input update */
-    vec_irq6_vblank();
+    func_table_call(0x0E9220); /* vec_irq6_vblank, via the dispatcher so its tail jumps run */
 
     /* Render VDP output and present frame */
     genrecomp_end_frame();
@@ -44,12 +49,18 @@ static void pigskin_vblank(void) {
     s_frame_count++;
     if (s_frame_count <= 10 || (s_frame_count % 60 == 0)) {
         printf("Frame %d (SP=$%08X)\n", s_frame_count, g_m68k.a[7]);
+        /* PIGSKIN_STACK=1: where is the main thread? (see docs/debugging.md) */
+        if (getenv("PIGSKIN_STACK")) {
+            func_table_dump_stack(stdout);
+            printf("  a0=%06X a1=%06X a2=%06X d0=%08X d1=%08X\n",
+                   g_m68k.a[0], g_m68k.a[1], g_m68k.a[2], g_m68k.d[0], g_m68k.d[1]);
+        }
         fflush(stdout);
     }
 }
 
 int main(int argc, char *argv[]) {
-    (void)argc; (void)argv;
+    argc = platform_parse_args(argc, argv);
 
     printf("Pigskin Footbrawl -- Static Recompilation\n");
     printf("==========================================\n\n");
@@ -69,12 +80,10 @@ int main(int argc, char *argv[]) {
 
     /* Register all recompiled functions */
     recomp_register_all();
-    printf("Registered %d recompiled functions\n\n", 1164);
 
     /* Register VBlank callback — this drives the entire frame loop
      * since the game never returns from entry_point(). */
     bus_set_vblank_callback(pigskin_vblank);
-
 
     /* Set initial CPU state */
     g_m68k.a[7] = 0xFFFD00;
@@ -86,7 +95,7 @@ int main(int argc, char *argv[]) {
      * rendering handled by the VBlank callback above. */
     printf("Starting game...\n");
     fflush(stdout);
-    entry_point();
+    func_table_call(0x000200); /* entry_point */
 
     /* If we somehow get here, clean up */
     printf("entry_point() returned unexpectedly\n");

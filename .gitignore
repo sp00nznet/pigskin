@@ -44,3 +44,13 @@ Makefile
 *.log
 *.tmp
 __pycache__/
+
+# Generated from the user's ROM: never committed (house rules section 3)
+src/recomp/
+functions.json
+
+# Run output and setup
+*.mp4
+ram_*.bin
+setup.log
+Play Pigskin.cmd
